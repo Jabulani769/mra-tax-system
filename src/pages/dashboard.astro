@@ -1,0 +1,44 @@
+---
+// src/pages/dashboard.astro
+import { createSupabaseServer } from '../lib/supabase';
+
+const { cookies } = Astro;
+const supabase = createSupabaseServer(cookies);
+const { data: { session } } = await supabase.auth.getSession();
+
+if (!session) {
+  return Astro.redirect('/login');
+}
+
+const userEmail = session.user.email;
+const userMetadata = session.user.user_metadata;
+const fullName = userMetadata?.full_name || 'User';
+---
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Dashboard - MRA Tax System</title>
+  <style is:global>
+    body { font-family: system-ui, sans-serif; background: #f3f4f6; margin: 0; padding: 2rem; }
+    .card { max-width: 600px; margin: 0 auto; background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+    .btn-logout { background: #ef4444; color: white; padding: 0.8rem 1.5rem; border: none; border-radius: 6px; cursor: pointer; }
+    .btn-logout:hover { background: #dc2626; }
+  </style>
+</head>
+<body>
+
+  <div class="card">
+    <h1>Welcome, {fullName}!</h1>
+    <p>Logged in as: {userEmail}</p>
+    <p>This is your MRA Taxpayer / Officer Dashboard (protected page).</p>
+
+    <form method="POST" action="/api/logout">
+      <button type="submit" class="btn-logout">Log Out</button>
+    </form>
+  </div>
+
+</body>
+</html>

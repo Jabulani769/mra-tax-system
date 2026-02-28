@@ -1,0 +1,75 @@
+---
+// src/pages/login.astro
+import { createSupabaseServer } from '../lib/supabase';
+
+const { cookies } = Astro;
+const supabase = createSupabaseServer(cookies);
+const session = await supabase.auth.getSession();
+
+if (session.data.session) {
+  return Astro.redirect('/dashboard');
+}
+
+let errorMessage = '';
+
+if (Astro.request.method === 'POST') {
+  const formData = await Astro.request.formData();
+  const email = formData.get('email')?.toString();
+  const password = formData.get('password')?.toString();
+
+  if (email && password) {
+    const { error } = await supabase.auth.signInWithPassword({
+      email,
+      password,
+    });
+
+    if (error) {
+      errorMessage = error.message;
+    } else {
+      return Astro.redirect('/dashboard');
+    }
+  } else {
+    errorMessage = 'Email and password required.';
+  }
+}
+---
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Log In - MRA Tax System</title>
+  <style is:global> /* same styles as signup */ 
+    body { font-family: system-ui, sans-serif; background: #f3f4f6; margin: 0; padding: 2rem; }
+    .card { max-width: 420px; margin: 0 auto; background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+    input { display: block; width: 100%; padding: 0.75rem; margin: 0.5rem 0; border: 1px solid #d1d5db; border-radius: 6px; }
+    button { width: 100%; padding: 0.9rem; background: #3b82f6; color: white; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; }
+    button:hover { background: #2563eb; }
+    .error { color: #dc2626; font-size: 0.9rem; margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+
+  <div class="card">
+    <h1 style="text-align:center; color:#1e40af;">MRA Tax Login</h1>
+
+    {errorMessage && <p class="error">{errorMessage}</p>}
+
+    <form method="POST">
+      <label>Email</label>
+      <input type="email" name="email" required />
+
+      <label>Password</label>
+      <input type="password" name="password" required />
+
+      <button type="submit">Log In</button>
+    </form>
+
+    <p style="text-align:center; margin-top:1.5rem;">
+      New user? <a href="/signup" style="color:#3b82f6;">Sign up</a>
+    </p>
+  </div>
+
+</body>
+</html>
