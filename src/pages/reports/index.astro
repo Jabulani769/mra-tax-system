@@ -1,0 +1,297 @@
+---
+import DashLayout from '../../layouts/DashLayout.astro';
+import { createSupabaseServer, formatMWK, formatDate } from '../../lib/supabase';
+
+const supabase = createSupabaseServer(Astro.cookies);
+const { data: { session } } = await supabase.auth.getSession();
+if (!session) return Astro.redirect('/login');
+
+const { data: userProfile } = await supabase
+  .from('users').select('*').eq('id', session.user.id).single();
+const role = userProfile?.role || 'taxpayer';
+if (role === 'taxpayer') return Astro.redirect('/dashboard');
+
+// Load aggregate stats for reports
+const [
+  { count: totalTaxpayers },
+  { count: totalReturns },
+  { count: pendingReturns },
+  { count: acceptedReturns },
+  { count: totalPayments },
+  { count: confirmedPayments },
+  { count: openAudits },
+  { count: closedAudits },
+] = await Promise.all([
+  supabase.from('taxpayers').select('*', { count: 'exact', head: true }),
+  supabase.from('tax_returns').select('*', { count: 'exact', head: true }),
+  supabase.from('tax_returns').select('*', { count: 'exact', head: true }).eq('status', 'submitted'),
+  supabase.from('tax_returns').select('*', { count: 'exact', head: true }).eq('status', 'accepted'),
+  supabase.from('payments').select('*', { count: 'exact', head: true }),
+  supabase.from('payments').select('*', { count: 'exact', head: true }).eq('status', 'confirmed'),
+  supabase.from('audits').select('*', { count: 'exact', head: true }).in('status', ['initiated','in_progress','findings_issued']),
+  supabase.from('audits').select('*', { count: 'exact', head: true }).eq('status', 'closed'),
+]);
+
+// Revenue totals
+const { data: revenueData } = await supabase
+  .from('payments')
+  .select('amount, tax_type, payment_date')
+  .eq('status', 'confirmed');
+
+const totalRevenue = (revenueData || []).reduce((s, p) => s + (Number(p.amount) || 0), 0);
+
+// Revenue by tax type
+const revenueByType: Record<string, number> = {};
+(revenueData || []).forEach(p => {
+  revenueByType[p.tax_type] = (revenueByType[p.tax_type] || 0) + (Number(p.amount) || 0);
+});
+
+// Returns by status
+const { data: returnsByStatus } = await supabase
+  .from('tax_returns')
+  .select('status, amount_due');
+
+const statusGroups: Record<string, { count: number; total: number }> = {};
+(returnsByStatus || []).forEach(r => {
+  if (!statusGroups[r.status]) statusGroups[r.status] = { count: 0, total: 0 };
+  statusGroups[r.status].count++;
+  statusGroups[r.status].total += Number(r.amount_due) || 0;
+});
+
+// Recent monthly revenue (last 6 months)
+const monthlyRevenue: Record<string, number> = {};
+(revenueData || []).forEach(p => {
+  const month = p.payment_date?.substring(0, 7);
+  if (month) monthlyRevenue[month] = (monthlyRevenue[month] || 0) + (Number(p.amount) || 0);
+});
+const sortedMonths = Object.entries(monthlyRevenue)
+  .sort(([a], [b]) => a.localeCompare(b))
+  .slice(-6);
+
+const taxTypeLabel: Record<string, string> = {
+  income_tax:      'Income Tax',
+  vat:             'VAT',
+  withholding_tax: 'Withholding Tax',
+  corporate_tax:   'Corporate Tax',
+  pay_as_you_earn: 'PAYE',
+};
+
+const statusLabel: Record<string, string> = {
+  draft: 'Draft', submitted: 'Submitted', under_review: 'Under Review',
+  assessed: 'Assessed', accepted: 'Accepted', rejected: 'Rejected', amended: 'Amended',
+};
+
+const maxRevenue = sortedMonths.length > 0 ? Math.max(...sortedMonths.map(([, v]) => v)) : 1;
+const maxTypeRevenue = Object.values(revenueByType).length > 0 ? Math.max(...Object.values(revenueByType)) : 1;
+
+const today = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
+---
+
+<DashLayout title="Reports" activeNav="/reports">
+  <div class="page-header">
+    <div>
+      <h1 class="page-title">Reports &amp; Analytics</h1>
+      <p class="page-subtitle">System-wide summary as of {today}</p>
+    </div>
+    <button onclick="window.print()" class="btn btn-ghost">🖨 Print Report</button>
+  </div>
+
+  <!-- KPI cards -->
+  <div class="kpi-grid">
+    <div class="kpi-card green">
+      <div class="kpi-icon">💰</div>
+      <div class="kpi-value mono">{formatMWK(totalRevenue)}</div>
+      <div class="kpi-label">Total Revenue Collected</div>
+      <div class="kpi-sub">{confirmedPayments || 0} confirmed payments</div>
+    </div>
+    <div class="kpi-card blue">
+      <div class="kpi-icon">👥</div>
+      <div class="kpi-value">{totalTaxpayers || 0}</div>
+      <div class="kpi-label">Registered Taxpayers</div>
+    </div>
+    <div class="kpi-card gold">
+      <div class="kpi-icon">📋</div>
+      <div class="kpi-value">{totalReturns || 0}</div>
+      <div class="kpi-label">Total Returns Filed</div>
+      <div class="kpi-sub">{pendingReturns || 0} pending review</div>
+    </div>
+    <div class="kpi-card red">
+      <div class="kpi-icon">🔍</div>
+      <div class="kpi-value">{openAudits || 0}</div>
+      <div class="kpi-label">Active Audits</div>
+      <div class="kpi-sub">{closedAudits || 0} closed</div>
+    </div>
+  </div>
+
+  <div class="reports-grid">
+
+    <!-- Monthly revenue chart -->
+    <div class="card">
+      <h2 class="report-section-title">Monthly Revenue (Last 6 Months)</h2>
+      {sortedMonths.length > 0 ? (
+        <div class="bar-chart">
+          {sortedMonths.map(([month, amount]) => {
+            const pct = maxRevenue > 0 ? (amount / maxRevenue) * 100 : 0;
+            const label = new Date(month + '-01').toLocaleDateString('en-GB', { month: 'short', year: '2-digit' });
+            return (
+              <div class="bar-item">
+                <div class="bar-label-top mono">{formatMWK(amount).replace('MWK', '').trim()}</div>
+                <div class="bar-track">
+                  <div class="bar-fill" style={`height:${pct}%`}></div>
+                </div>
+                <div class="bar-label-bot">{label}</div>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div class="empty-state" style="padding:2rem;">
+          <p>No confirmed payment data available yet.</p>
+        </div>
+      )}
+    </div>
+
+    <!-- Revenue by tax type -->
+    <div class="card">
+      <h2 class="report-section-title">Revenue by Tax Type</h2>
+      {Object.entries(revenueByType).length > 0 ? (
+        <div class="type-chart">
+          {Object.entries(revenueByType)
+            .sort(([,a],[,b]) => b - a)
+            .map(([type, amount]) => {
+              const pct = maxTypeRevenue > 0 ? (amount / maxTypeRevenue) * 100 : 0;
+              const sharePct = totalRevenue > 0 ? ((amount / totalRevenue) * 100).toFixed(1) : '0';
+              return (
+                <div class="type-row">
+                  <div class="type-name">{taxTypeLabel[type] || type}</div>
+                  <div class="type-bar-wrap">
+                    <div class="type-bar">
+                      <div class="type-fill" style={`width:${pct}%`}></div>
+                    </div>
+                    <span class="type-pct">{sharePct}%</span>
+                  </div>
+                  <div class="type-amount mono">{formatMWK(amount)}</div>
+                </div>
+              );
+          })}
+        </div>
+      ) : (
+        <div class="empty-state" style="padding:2rem;"><p>No revenue data yet.</p></div>
+      )}
+    </div>
+
+    <!-- Returns by status -->
+    <div class="card">
+      <h2 class="report-section-title">Returns by Status</h2>
+      <div class="status-breakdown">
+        {Object.entries(statusGroups).map(([status, data]) => (
+          <div class="status-row">
+            <div class="status-dot" style={`background:${
+              status === 'accepted' ? 'var(--mra-green)' :
+              status === 'rejected' ? 'var(--mra-red)'   :
+              status === 'submitted' || status === 'under_review' ? 'var(--mra-gold)' : 'var(--mra-gray-300)'
+            }`}></div>
+            <div class="status-name">{statusLabel[status] || status}</div>
+            <div class="status-count badge badge-gray">{data.count}</div>
+            <div class="status-amount mono">{formatMWK(data.total)}</div>
+          </div>
+        ))}
+        {Object.keys(statusGroups).length === 0 && (
+          <p class="text-muted text-sm">No returns filed yet.</p>
+        )}
+      </div>
+    </div>
+
+    <!-- System summary -->
+    <div class="card">
+      <h2 class="report-section-title">System Summary</h2>
+      <div class="summary-table">
+        <div class="summary-row"><span>Registered Taxpayers</span><strong>{totalTaxpayers || 0}</strong></div>
+        <div class="summary-row"><span>Total Returns Filed</span><strong>{totalReturns || 0}</strong></div>
+        <div class="summary-row"><span>Returns Accepted</span><strong>{acceptedReturns || 0}</strong></div>
+        <div class="summary-row"><span>Returns Pending</span><strong>{pendingReturns || 0}</strong></div>
+        <div class="summary-row"><span>Total Payments Recorded</span><strong>{totalPayments || 0}</strong></div>
+        <div class="summary-row"><span>Payments Confirmed</span><strong>{confirmedPayments || 0}</strong></div>
+        <div class="summary-row"><span>Active Audits</span><strong>{openAudits || 0}</strong></div>
+        <div class="summary-row"><span>Closed Audits</span><strong>{closedAudits || 0}</strong></div>
+        <div class="summary-row total-row">
+          <span>Total Revenue Collected</span>
+          <strong class="mono">{formatMWK(totalRevenue)}</strong>
+        </div>
+      </div>
+    </div>
+  </div>
+</DashLayout>
+
+<style>
+  .kpi-grid {
+    display:grid; grid-template-columns:repeat(auto-fill, minmax(200px,1fr));
+    gap:1rem; margin-bottom:1.5rem;
+  }
+  .kpi-card {
+    background:#fff; border-radius:var(--radius);
+    border:1px solid var(--mra-gray-200); padding:1.25rem 1.5rem;
+    position:relative; overflow:hidden;
+  }
+  .kpi-card.green { border-top:3px solid var(--mra-green); }
+  .kpi-card.blue  { border-top:3px solid #2196f3; }
+  .kpi-card.gold  { border-top:3px solid var(--mra-gold); }
+  .kpi-card.red   { border-top:3px solid var(--mra-red); }
+  .kpi-icon  { font-size:1.5rem; margin-bottom:0.5rem; }
+  .kpi-value { font-size:1.5rem; font-weight:700; color:var(--mra-gray-900); line-height:1.2; margin-bottom:0.3rem; }
+  .kpi-label { font-size:0.8rem; font-weight:700; color:var(--mra-gray-600); text-transform:uppercase; letter-spacing:0.05em; }
+  .kpi-sub   { font-size:0.78rem; color:var(--mra-gray-400); margin-top:0.2rem; }
+
+  .reports-grid { display:grid; grid-template-columns:1fr 1fr; gap:1.25rem; }
+  @media (max-width:900px) { .reports-grid { grid-template-columns:1fr; } }
+
+  .report-section-title {
+    font-size:0.82rem; text-transform:uppercase; letter-spacing:0.07em;
+    color:var(--mra-gray-500); font-family:var(--font-sans);
+    font-weight:700; margin-bottom:1.25rem;
+  }
+
+  /* Bar chart */
+  .bar-chart { display:flex; align-items:flex-end; gap:0.5rem; height:140px; padding-top:1.5rem; }
+  .bar-item  { display:flex; flex-direction:column; align-items:center; flex:1; height:100%; }
+  .bar-label-top { font-size:0.65rem; color:var(--mra-gray-500); font-family:var(--font-mono); margin-bottom:0.25rem; white-space:nowrap; }
+  .bar-track { flex:1; width:100%; background:var(--mra-gray-100); border-radius:4px 4px 0 0; display:flex; align-items:flex-end; overflow:hidden; }
+  .bar-fill  { width:100%; background:var(--mra-green); border-radius:4px 4px 0 0; transition:height 0.4s ease; min-height:2px; }
+  .bar-label-bot { font-size:0.72rem; color:var(--mra-gray-500); margin-top:0.3rem; white-space:nowrap; }
+
+  /* Type chart */
+  .type-chart { display:flex; flex-direction:column; gap:0.85rem; }
+  .type-row  { display:grid; grid-template-columns:120px 1fr 110px; align-items:center; gap:0.5rem; }
+  .type-name { font-size:0.82rem; color:var(--mra-gray-700); font-weight:600; }
+  .type-bar-wrap { display:flex; align-items:center; gap:0.35rem; }
+  .type-bar  { flex:1; height:8px; background:var(--mra-gray-100); border-radius:4px; overflow:hidden; }
+  .type-fill { height:100%; background:var(--mra-green); border-radius:4px; }
+  .type-pct  { font-size:0.72rem; color:var(--mra-gray-500); width:32px; text-align:right; }
+  .type-amount { font-size:0.78rem; color:var(--mra-gray-700); text-align:right; }
+
+  /* Status breakdown */
+  .status-breakdown { display:flex; flex-direction:column; gap:0; }
+  .status-row { display:flex; align-items:center; gap:0.6rem; padding:0.5rem 0; border-bottom:1px dashed var(--mra-gray-100); }
+  .status-dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; }
+  .status-name { flex:1; font-size:0.85rem; color:var(--mra-gray-700); text-transform:capitalize; }
+  .status-count { font-size:0.7rem; }
+  .status-amount { font-size:0.8rem; color:var(--mra-gray-600); min-width:100px; text-align:right; }
+
+  /* Summary table */
+  .summary-table { display:flex; flex-direction:column; }
+  .summary-row {
+    display:flex; justify-content:space-between; align-items:center;
+    padding:0.55rem 0; border-bottom:1px solid var(--mra-gray-100);
+    font-size:0.88rem; color:var(--mra-gray-700);
+  }
+  .summary-row.total-row {
+    background:var(--mra-green-light); margin:0.5rem -1.5rem -1.5rem;
+    padding:0.85rem 1.5rem; border-bottom:none; font-weight:700;
+    color:var(--mra-green-dark); border-radius:0 0 var(--radius) var(--radius);
+  }
+
+  @media print {
+    .sidebar, .topbar, .btn { display:none !important; }
+    .dash-main { margin-left:0 !important; }
+  }
+</style>

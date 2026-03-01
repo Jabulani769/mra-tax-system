@@ -1,0 +1,273 @@
+---
+import DashLayout from '../../layouts/DashLayout.astro';
+import { createSupabaseServer, formatDate } from '../../lib/supabase';
+
+const supabase = createSupabaseServer(Astro.cookies);
+const { data: { session } } = await supabase.auth.getSession();
+if (!session) return Astro.redirect('/login');
+
+const { data: userProfile } = await supabase
+  .from('users').select('*').eq('id', session.user.id).single();
+const role = userProfile?.role || 'taxpayer';
+
+// Get taxpayer id for taxpayer role
+let taxpayerId: string | null = null;
+if (role === 'taxpayer') {
+  const { data: taxpayer } = await supabase
+    .from('taxpayers').select('id').eq('user_id', session.user.id).single();
+  taxpayerId = taxpayer?.id || null;
+}
+
+// Mark all as read on POST
+if (Astro.request.method === 'POST') {
+  const form   = await Astro.request.formData();
+  const action = form.get('_action')?.toString();
+
+  if (action === 'mark_all_read') {
+    if (taxpayerId) {
+      await supabase.from('notifications').update({ is_read: true, read_at: new Date().toISOString() })
+        .eq('taxpayer_id', taxpayerId).eq('is_read', false);
+    }
+    return Astro.redirect('/notifications');
+  }
+
+  if (action === 'mark_read') {
+    const notifId = form.get('notif_id')?.toString();
+    if (notifId) {
+      await supabase.from('notifications').update({ is_read: true, read_at: new Date().toISOString() })
+        .eq('id', notifId);
+    }
+    return Astro.redirect('/notifications');
+  }
+}
+
+// Load notifications
+let notifQuery;
+if (role === 'taxpayer' && taxpayerId) {
+  notifQuery = supabase
+    .from('notifications')
+    .select('*')
+    .eq('taxpayer_id', taxpayerId)
+    .order('created_at', { ascending: false });
+} else if (role !== 'taxpayer') {
+  // Officers/admins see all notifications
+  notifQuery = supabase
+    .from('notifications')
+    .select('*, taxpayers(tin, name)')
+    .order('created_at', { ascending: false })
+    .limit(100);
+} else {
+  notifQuery = supabase.from('notifications').select('*').limit(0);
+}
+
+const { data: notifications } = await notifQuery;
+const all     = notifications || [];
+const unread  = all.filter(n => !n.is_read);
+const hasUnread = unread.length > 0;
+
+const typeIcon: Record<string, string> = {
+  info:     'ℹ️',
+  warning:  '⚠️',
+  overdue:  '🔴',
+  audit:    '🔍',
+  payment:  '💳',
+  reminder: '🔔',
+};
+
+const typeBadge: Record<string, string> = {
+  info:     'badge-blue',
+  warning:  'badge-yellow',
+  overdue:  'badge-red',
+  audit:    'badge-orange',
+  payment:  'badge-green',
+  reminder: 'badge-gray',
+};
+
+// Officer: send notification form
+let sendError = '';
+let sendSuccess = '';
+
+if (Astro.request.method === 'POST' && role !== 'taxpayer') {
+  const form = await Astro.request.formData();
+  const action = form.get('_action')?.toString();
+
+  if (action === 'send') {
+    const toTaxpayerId = form.get('taxpayer_id')?.toString() || '';
+    const subject      = form.get('subject')?.toString().trim() || '';
+    const message      = form.get('message')?.toString().trim() || '';
+    const type         = form.get('type')?.toString() || 'info';
+
+    if (!toTaxpayerId || !subject || !message) {
+      sendError = 'All fields are required.';
+    } else {
+      const { error } = await supabase.from('notifications').insert({
+        taxpayer_id: toTaxpayerId,
+        subject,
+        message,
+        type,
+        created_by: session.user.id,
+      });
+      if (error) sendError = error.message;
+      else return Astro.redirect('/notifications?sent=1');
+    }
+  }
+}
+
+const sent = Astro.url.searchParams.get('sent') === '1';
+
+// For officer send form
+let taxpayerList: any[] = [];
+if (role !== 'taxpayer') {
+  const { data: tlist } = await supabase
+    .from('taxpayers').select('id, tin, name').order('name');
+  taxpayerList = tlist || [];
+}
+---
+
+<DashLayout title="Notifications" activeNav="/notifications">
+  <div class="page-header">
+    <div>
+      <h1 class="page-title">Notifications</h1>
+      <p class="page-subtitle">
+        {hasUnread ? `You have ${unread.length} unread notification${unread.length !== 1 ? 's' : ''}` : 'All caught up'}
+      </p>
+    </div>
+    {hasUnread && role === 'taxpayer' && (
+      <form method="POST">
+        <input type="hidden" name="_action" value="mark_all_read" />
+        <button type="submit" class="btn btn-ghost">✓ Mark All Read</button>
+      </form>
+    )}
+  </div>
+
+  {sent && <div class="alert alert-success" style="margin-bottom:1.25rem;">✓ Notification sent successfully.</div>}
+
+  <div class={role !== 'taxpayer' ? 'notif-layout' : ''}>
+    <div>
+      <!-- Notification list -->
+      {all.length > 0 ? (
+        <div class="notif-list">
+          {all.map((n: any) => (
+            <div class={`notif-item ${!n.is_read ? 'unread' : ''}`}>
+              <div class="notif-icon">{typeIcon[n.type] || 'ℹ️'}</div>
+              <div class="notif-body">
+                <div class="notif-top">
+                  <span class="notif-subject">{n.subject}</span>
+                  <span class={`badge ${typeBadge[n.type] || 'badge-gray'}`} style="font-size:0.68rem;">{n.type}</span>
+                  {!n.is_read && <span class="unread-dot"></span>}
+                </div>
+                {role !== 'taxpayer' && n.taxpayers && (
+                  <div class="notif-taxpayer">
+                    To: <span class="mono">{n.taxpayers.tin}</span> · {n.taxpayers.name}
+                  </div>
+                )}
+                <p class="notif-message">{n.message}</p>
+                <div class="notif-meta">
+                  <span>{formatDate(n.created_at)}</span>
+                  {n.is_read && n.read_at && <span>· Read {formatDate(n.read_at)}</span>}
+                </div>
+              </div>
+              {!n.is_read && role === 'taxpayer' && (
+                <form method="POST" style="flex-shrink:0;">
+                  <input type="hidden" name="_action" value="mark_read" />
+                  <input type="hidden" name="notif_id" value={n.id} />
+                  <button type="submit" class="btn btn-ghost btn-sm">Mark Read</button>
+                </form>
+              )}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div class="card">
+          <div class="empty-state">
+            <div class="empty-state-icon">🔔</div>
+            <h3>No notifications</h3>
+            <p>{role === 'taxpayer' ? 'You have no notifications at this time.' : 'No notifications have been sent yet.'}</p>
+          </div>
+        </div>
+      )}
+    </div>
+
+    <!-- Officer: send notification panel -->
+    {role !== 'taxpayer' && (
+      <div>
+        <div class="card send-panel">
+          <h3 style="font-size:0.82rem; text-transform:uppercase; letter-spacing:0.07em; color:var(--mra-gray-500); margin-bottom:1rem;">Send Notification</h3>
+
+          {sendError && <div class="alert alert-danger" style="margin-bottom:1rem; font-size:0.85rem;">{sendError}</div>}
+
+          <form method="POST">
+            <input type="hidden" name="_action" value="send" />
+
+            <div class="form-group">
+              <label class="form-label required">To (Taxpayer)</label>
+              <select name="taxpayer_id" class="form-control" required>
+                <option value="">— Select taxpayer —</option>
+                {taxpayerList.map(t => (
+                  <option value={t.id}>{t.tin} · {t.name}</option>
+                ))}
+              </select>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label required">Type</label>
+              <select name="type" class="form-control">
+                <option value="info">ℹ️ Info</option>
+                <option value="warning">⚠️ Warning</option>
+                <option value="overdue">🔴 Overdue</option>
+                <option value="audit">🔍 Audit</option>
+                <option value="payment">💳 Payment</option>
+                <option value="reminder">🔔 Reminder</option>
+              </select>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label required">Subject</label>
+              <input type="text" name="subject" class="form-control" placeholder="Notification subject..." required />
+            </div>
+
+            <div class="form-group">
+              <label class="form-label required">Message</label>
+              <textarea name="message" class="form-control" rows="4"
+                placeholder="Write your message to the taxpayer..." required></textarea>
+            </div>
+
+            <button type="submit" class="btn btn-primary w-full">Send Notification →</button>
+          </form>
+        </div>
+      </div>
+    )}
+  </div>
+</DashLayout>
+
+<style>
+  .notif-layout { display:grid; grid-template-columns:1fr 300px; gap:1.5rem; align-items:start; }
+  @media (max-width:900px) { .notif-layout { grid-template-columns:1fr; } }
+
+  .notif-list { display:flex; flex-direction:column; gap:0; }
+  .notif-item {
+    display:flex; align-items:flex-start; gap:0.85rem;
+    padding:1.1rem 1.25rem;
+    background:#fff; border:1px solid var(--mra-gray-200);
+    border-bottom:none; transition:background 0.1s;
+  }
+  .notif-item:first-child { border-radius:var(--radius) var(--radius) 0 0; }
+  .notif-item:last-child  { border-bottom:1px solid var(--mra-gray-200); border-radius:0 0 var(--radius) var(--radius); }
+  .notif-item:only-child  { border-radius:var(--radius); }
+  .notif-item.unread      { background:#fafffe; border-left:3px solid var(--mra-green); }
+  .notif-item:hover       { background:var(--mra-gray-50); }
+
+  .notif-icon { font-size:1.25rem; flex-shrink:0; margin-top:0.1rem; }
+  .notif-body { flex:1; min-width:0; }
+  .notif-top  { display:flex; align-items:center; gap:0.5rem; flex-wrap:wrap; margin-bottom:0.2rem; }
+  .notif-subject { font-weight:700; font-size:0.9rem; color:var(--mra-gray-900); }
+  .unread-dot {
+    width:8px; height:8px; border-radius:50%;
+    background:var(--mra-green); flex-shrink:0; margin-left:auto;
+  }
+  .notif-taxpayer { font-size:0.78rem; color:var(--mra-gray-500); margin-bottom:0.25rem; }
+  .notif-message  { font-size:0.85rem; color:var(--mra-gray-700); margin:0.25rem 0 0.4rem; line-height:1.5; }
+  .notif-meta     { font-size:0.75rem; color:var(--mra-gray-400); }
+
+  .send-panel { padding:1.25rem; position:sticky; top:1.5rem; }
+</style>

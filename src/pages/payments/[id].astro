@@ -1,0 +1,191 @@
+---
+import DashLayout from '../../layouts/DashLayout.astro';
+import { createSupabaseServer, formatMWK, formatDate } from '../../lib/supabase';
+
+const supabase = createSupabaseServer(Astro.cookies);
+const { data: { session } } = await supabase.auth.getSession();
+if (!session) return Astro.redirect('/login');
+
+const { data: userProfile } = await supabase
+  .from('users').select('role').eq('id', session.user.id).single();
+const role = userProfile?.role || 'taxpayer';
+
+const { id } = Astro.params;
+
+const { data: payment, error } = await supabase
+  .from('payments')
+  .select('*, taxpayers(id, tin, name, user_id), tax_returns(return_reference, tax_type, period_from, period_to, amount_due)')
+  .eq('id', id)
+  .single();
+
+if (error || !payment) return Astro.redirect('/payments');
+
+// Taxpayer can only view their own payments
+if (role === 'taxpayer') {
+  const { data: tp } = await supabase.from('taxpayers').select('id').eq('user_id', session.user.id).single();
+  if (!tp || tp.id !== payment.taxpayer_id) return Astro.redirect('/payments');
+}
+
+let actionError = '';
+let actionSuccess = '';
+
+if (Astro.request.method === 'POST' && role !== 'taxpayer') {
+  const form   = await Astro.request.formData();
+  const action = form.get('_action')?.toString();
+
+  if (action === 'confirm') {
+    const { error: e } = await supabase.from('payments')
+      .update({ status: 'confirmed', confirmed_by: session.user.id, confirmed_at: new Date().toISOString() })
+      .eq('id', id);
+    if (e) actionError = e.message;
+    else return Astro.redirect(`/payments/${id}?done=confirmed`);
+  }
+
+  if (action === 'reverse') {
+    const { error: e } = await supabase.from('payments')
+      .update({ status: 'reversed' }).eq('id', id);
+    if (e) actionError = e.message;
+    else return Astro.redirect(`/payments/${id}?done=reversed`);
+  }
+}
+
+const done = Astro.url.searchParams.get('done');
+
+const methodLabel: Record<string, string> = {
+  bank_transfer: 'Bank Transfer', mobile_money: 'Mobile Money',
+  cash: 'Cash', cheque: 'Cheque',
+};
+const taxTypeLabel: Record<string, string> = {
+  income_tax: 'Income Tax', vat: 'VAT', withholding_tax: 'Withholding Tax',
+  corporate_tax: 'Corporate Tax', pay_as_you_earn: 'PAYE',
+};
+---
+
+<DashLayout title={`Payment ${payment.payment_reference}`} activeNav="/payments">
+  <div class="page-header">
+    <div>
+      <div style="display:flex; align-items:center; gap:0.75rem;">
+        <h1 class="page-title" style="margin:0;">{payment.payment_reference}</h1>
+        <span class={`badge ${payment.status === 'confirmed' ? 'badge-green' : payment.status === 'reversed' ? 'badge-red' : 'badge-yellow'}`}
+          style="font-size:0.8rem; padding:0.3em 0.85em;">{payment.status}</span>
+      </div>
+      <p class="page-subtitle">{formatMWK(payment.amount)} · {methodLabel[payment.payment_method] || payment.payment_method}</p>
+    </div>
+    <a href="/payments" class="btn btn-ghost">← All Payments</a>
+  </div>
+
+  {done === 'confirmed' && <div class="alert alert-success" style="margin-bottom:1.25rem;">✓ Payment confirmed successfully.</div>}
+  {done === 'reversed'  && <div class="alert alert-danger"  style="margin-bottom:1.25rem;">Payment has been reversed.</div>}
+  {actionError          && <div class="alert alert-danger"  style="margin-bottom:1.25rem;">{actionError}</div>}
+
+  <div class="detail-layout">
+    <div>
+      <!-- Amount card -->
+      <div class="amount-card card">
+        <div class="amount-label">Payment Amount</div>
+        <div class="amount-value mono">{formatMWK(payment.amount)}</div>
+        <div class="amount-meta">
+          {methodLabel[payment.payment_method] || payment.payment_method} ·
+          {formatDate(payment.payment_date)}
+        </div>
+      </div>
+
+      <!-- Details -->
+      <div class="card" style="margin-top:1.25rem;">
+        <h2 style="font-size:0.85rem; text-transform:uppercase; letter-spacing:0.07em; color:var(--mra-gray-500); margin-bottom:1rem;">Payment Details</h2>
+        <div class="detail-row"><span class="detail-label">Reference</span><span class="detail-value mono">{payment.payment_reference}</span></div>
+        <div class="detail-row"><span class="detail-label">Amount</span><span class="detail-value mono" style="font-weight:700;">{formatMWK(payment.amount)}</span></div>
+        <div class="detail-row"><span class="detail-label">Tax Type</span><span class="detail-value">{taxTypeLabel[payment.tax_type] || payment.tax_type || '—'}</span></div>
+        <div class="detail-row"><span class="detail-label">Payment Date</span><span class="detail-value">{formatDate(payment.payment_date)}</span></div>
+        <div class="detail-row"><span class="detail-label">Method</span><span class="detail-value">{methodLabel[payment.payment_method] || payment.payment_method}</span></div>
+        {payment.bank_name     && <div class="detail-row"><span class="detail-label">Bank</span><span class="detail-value">{payment.bank_name}</span></div>}
+        {payment.transaction_ref && <div class="detail-row"><span class="detail-label">Transaction Ref</span><span class="detail-value mono">{payment.transaction_ref}</span></div>}
+        <div class="detail-row"><span class="detail-label">Status</span>
+          <span class={`badge ${payment.status === 'confirmed' ? 'badge-green' : payment.status === 'reversed' ? 'badge-red' : 'badge-yellow'}`}>{payment.status}</span>
+        </div>
+        {payment.confirmed_at && <div class="detail-row"><span class="detail-label">Confirmed At</span><span class="detail-value">{formatDate(payment.confirmed_at)}</span></div>}
+        {payment.period && <div class="detail-row"><span class="detail-label">Period</span><span class="detail-value">{payment.period}</span></div>}
+        {payment.notes && (
+          <div style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--mra-gray-200);">
+            <div class="detail-label" style="margin-bottom:0.4rem;">Notes</div>
+            <p style="font-size:0.88rem; color:var(--mra-gray-700); margin:0; line-height:1.5;">{payment.notes}</p>
+          </div>
+        )}
+      </div>
+
+      <!-- Linked return -->
+      {payment.tax_returns && (
+        <div class="card" style="margin-top:1.25rem;">
+          <h2 style="font-size:0.85rem; text-transform:uppercase; letter-spacing:0.07em; color:var(--mra-gray-500); margin-bottom:1rem;">Linked Return</h2>
+          <div class="linked-return">
+            <div>
+              <div class="mono" style="font-weight:700; color:var(--mra-green);">{payment.tax_returns.return_reference}</div>
+              <div style="font-size:0.85rem; color:var(--mra-gray-600); margin-top:0.2rem;">
+                {taxTypeLabel[payment.tax_returns.tax_type]} · {formatDate(payment.tax_returns.period_from)} – {formatDate(payment.tax_returns.period_to)}
+              </div>
+            </div>
+            <div style="text-align:right;">
+              <div style="font-size:0.75rem; color:var(--mra-gray-500);">Return Amount Due</div>
+              <div class="mono" style="font-weight:700;">{formatMWK(payment.tax_returns.amount_due)}</div>
+            </div>
+          </div>
+          <a href={`/returns/${payment.return_id}`} class="btn btn-ghost btn-sm" style="margin-top:0.75rem;">View Return →</a>
+        </div>
+      )}
+    </div>
+
+    <!-- Sidebar -->
+    <div>
+      <!-- Taxpayer -->
+      <div class="card" style="padding:1.25rem;">
+        <h3 style="font-size:0.78rem; text-transform:uppercase; letter-spacing:0.07em; color:var(--mra-gray-500); margin-bottom:0.85rem;">Taxpayer</h3>
+        <div class="mono" style="font-size:1rem; font-weight:700; color:var(--mra-green); margin-bottom:0.2rem;">{payment.taxpayers?.tin}</div>
+        <div style="font-size:0.95rem; font-weight:600; color:var(--mra-gray-900); margin-bottom:0.75rem;">{payment.taxpayers?.name}</div>
+        {role !== 'taxpayer' && (
+          <a href={`/taxpayers/${payment.taxpayer_id}`} class="btn btn-ghost btn-sm w-full">View Profile →</a>
+        )}
+      </div>
+
+      <!-- Officer actions -->
+      {role !== 'taxpayer' && payment.status === 'pending' && (
+        <div class="card" style="margin-top:1rem; padding:1.25rem;">
+          <h3 style="font-size:0.78rem; text-transform:uppercase; letter-spacing:0.07em; color:var(--mra-gray-500); margin-bottom:0.85rem;">Actions</h3>
+          <form method="POST" style="display:flex; flex-direction:column; gap:0.5rem;">
+            <button type="submit" name="_action" value="confirm" class="btn btn-primary btn-sm">✓ Confirm Payment</button>
+            <button type="submit" name="_action" value="reverse" class="btn btn-danger btn-sm"
+              onclick="return confirm('Reverse this payment?')">✗ Reverse Payment</button>
+          </form>
+        </div>
+      )}
+
+      {role !== 'taxpayer' && payment.status === 'confirmed' && (
+        <div class="card" style="margin-top:1rem; padding:1.25rem;">
+          <h3 style="font-size:0.78rem; text-transform:uppercase; letter-spacing:0.07em; color:var(--mra-gray-500); margin-bottom:0.85rem;">Actions</h3>
+          <form method="POST">
+            <button type="submit" name="_action" value="reverse" class="btn btn-danger btn-sm w-full"
+              onclick="return confirm('Reverse this confirmed payment? This cannot be undone.')">Reverse Payment</button>
+          </form>
+        </div>
+      )}
+    </div>
+  </div>
+</DashLayout>
+
+<style>
+  .detail-layout { display:grid; grid-template-columns:1fr 240px; gap:1.5rem; align-items:start; }
+  @media (max-width:900px) { .detail-layout { grid-template-columns:1fr; } }
+
+  .amount-card {
+    background:var(--mra-green-dark); color:#fff; padding:1.5rem;
+    text-align:center;
+  }
+  .amount-label { font-size:0.75rem; text-transform:uppercase; letter-spacing:0.1em; color:rgba(255,255,255,0.6); margin-bottom:0.4rem; }
+  .amount-value { font-size:2rem; font-weight:700; color:var(--mra-gold); margin-bottom:0.4rem; }
+  .amount-meta  { font-size:0.85rem; color:rgba(255,255,255,0.65); }
+
+  .linked-return {
+    display:flex; justify-content:space-between; align-items:flex-start;
+    padding:0.85rem 1rem; background:var(--mra-gray-50);
+    border:1px solid var(--mra-gray-200); border-radius:var(--radius);
+  }
+</style>

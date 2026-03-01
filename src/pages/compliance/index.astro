@@ -1,0 +1,263 @@
+---
+import DashLayout from '../../layouts/DashLayout.astro';
+import { createSupabaseServer, formatMWK, formatDate } from '../../lib/supabase';
+
+const supabase = createSupabaseServer(Astro.cookies);
+const { data: { session } } = await supabase.auth.getSession();
+if (!session) return Astro.redirect('/login');
+
+const { data: userProfile } = await supabase
+  .from('users').select('*').eq('id', session.user.id).single();
+const role = userProfile?.role || 'taxpayer';
+if (role === 'taxpayer') return Astro.redirect('/dashboard');
+
+// Load all taxpayers with their returns and payments for compliance analysis
+const { data: taxpayers } = await supabase
+  .from('taxpayers')
+  .select('id, tin, name, taxpayer_type, verification_status, registration_date')
+  .order('name');
+
+// Load returns summary per taxpayer
+const { data: returns } = await supabase
+  .from('tax_returns')
+  .select('taxpayer_id, status, amount_due, submission_date, created_at');
+
+// Load confirmed payments
+const { data: payments } = await supabase
+  .from('payments')
+  .select('taxpayer_id, amount, status');
+
+// Load open audits
+const { data: audits } = await supabase
+  .from('audits')
+  .select('taxpayer_id, status');
+
+// Build compliance data per taxpayer
+const complianceData = (taxpayers || []).map(t => {
+  const tReturns  = (returns  || []).filter(r => r.taxpayer_id === t.id);
+  const tPayments = (payments || []).filter(p => p.taxpayer_id === t.id);
+  const tAudits   = (audits   || []).filter(a => a.taxpayer_id === t.id);
+
+  const totalDue  = tReturns.reduce((s, r) => s + (Number(r.amount_due) || 0), 0);
+  const totalPaid = tPayments.filter(p => p.status === 'confirmed').reduce((s, p) => s + (Number(p.amount) || 0), 0);
+  const balance   = totalDue - totalPaid;
+
+  const hasOverdue     = balance > 0 && tReturns.some(r => r.status === 'accepted');
+  const hasPending     = tReturns.some(r => r.status === 'submitted' || r.status === 'under_review');
+  const hasOpenAudit   = tAudits.some(a => ['initiated','in_progress','findings_issued'].includes(a.status));
+  const neverFiled     = tReturns.length === 0;
+  const unverified     = t.verification_status !== 'verified';
+
+  // Risk score: 0-100
+  let riskScore = 0;
+  if (neverFiled)   riskScore += 40;
+  if (hasOverdue)   riskScore += 30;
+  if (unverified)   riskScore += 20;
+  if (hasPending)   riskScore += 5;
+  if (hasOpenAudit) riskScore += 5;
+  riskScore = Math.min(riskScore, 100);
+
+  const riskLevel = riskScore >= 60 ? 'high' : riskScore >= 30 ? 'medium' : 'low';
+
+  return {
+    ...t,
+    totalReturns: tReturns.length,
+    totalDue,
+    totalPaid,
+    balance,
+    hasOverdue,
+    hasPending,
+    hasOpenAudit,
+    neverFiled,
+    riskScore,
+    riskLevel,
+  };
+});
+
+// Sort by risk score descending
+complianceData.sort((a, b) => b.riskScore - a.riskScore);
+
+const riskFilter = Astro.url.searchParams.get('risk') || 'all';
+const filtered   = riskFilter === 'all' ? complianceData : complianceData.filter(t => t.riskLevel === riskFilter);
+
+const summary = {
+  total:      complianceData.length,
+  highRisk:   complianceData.filter(t => t.riskLevel === 'high').length,
+  medRisk:    complianceData.filter(t => t.riskLevel === 'medium').length,
+  lowRisk:    complianceData.filter(t => t.riskLevel === 'low').length,
+  neverFiled: complianceData.filter(t => t.neverFiled).length,
+  totalOwing: complianceData.reduce((s, t) => s + (t.balance > 0 ? t.balance : 0), 0),
+};
+---
+
+<DashLayout title="Compliance" activeNav="/compliance">
+  <div class="page-header">
+    <div>
+      <h1 class="page-title">Compliance Monitor</h1>
+      <p class="page-subtitle">Risk-based taxpayer compliance overview</p>
+    </div>
+  </div>
+
+  <!-- Summary stats -->
+  <div class="stats-grid" style="margin-bottom:1.25rem;">
+    <div class="stat-card red">
+      <div class="stat-label">High Risk</div>
+      <div class="stat-value">{summary.highRisk}</div>
+      <div class="stat-sub">Taxpayers</div>
+    </div>
+    <div class="stat-card gold">
+      <div class="stat-label">Medium Risk</div>
+      <div class="stat-value">{summary.medRisk}</div>
+      <div class="stat-sub">Taxpayers</div>
+    </div>
+    <div class="stat-card green">
+      <div class="stat-label">Low Risk</div>
+      <div class="stat-value">{summary.lowRisk}</div>
+      <div class="stat-sub">Taxpayers</div>
+    </div>
+    <div class="stat-card blue">
+      <div class="stat-label">Never Filed</div>
+      <div class="stat-value">{summary.neverFiled}</div>
+      <div class="stat-sub">No returns on record</div>
+    </div>
+  </div>
+
+  <div class="owing-banner">
+    <div>
+      <div style="font-size:0.78rem; text-transform:uppercase; letter-spacing:0.08em; color:rgba(255,255,255,0.6); margin-bottom:0.3rem;">Total Outstanding Balance (System-wide)</div>
+      <div class="mono" style="font-size:1.4rem; font-weight:700; color:var(--mra-gold);">{formatMWK(summary.totalOwing)}</div>
+    </div>
+    <div style="font-size:0.82rem; color:rgba(255,255,255,0.6);">
+      Across {complianceData.filter(t => t.balance > 0).length} taxpayers with outstanding balances
+    </div>
+  </div>
+
+  <!-- Risk filter -->
+  <div class="risk-tabs">
+    {[
+      { key: 'all',    label: 'All Taxpayers', count: summary.total },
+      { key: 'high',   label: '🔴 High Risk',   count: summary.highRisk },
+      { key: 'medium', label: '🟡 Medium Risk', count: summary.medRisk },
+      { key: 'low',    label: '🟢 Low Risk',    count: summary.lowRisk },
+    ].map(tab => (
+      <a href={`/compliance?risk=${tab.key}`}
+        class={`risk-tab ${riskFilter === tab.key ? 'active' : ''}`}>
+        {tab.label}
+        <span class="tab-count">{tab.count}</span>
+      </a>
+    ))}
+  </div>
+
+  <!-- Compliance table -->
+  <div class="card" style="padding:0; margin-top:1rem;">
+    {filtered.length > 0 ? (
+      <div class="table-wrapper" style="border:none;">
+        <table>
+          <thead>
+            <tr>
+              <th>Taxpayer</th>
+              <th>TIN</th>
+              <th>Risk Score</th>
+              <th>Returns</th>
+              <th>Total Due</th>
+              <th>Total Paid</th>
+              <th>Balance</th>
+              <th>Flags</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map(t => (
+              <tr>
+                <td>
+                  <div style="font-weight:600; font-size:0.88rem;">{t.name}</div>
+                  <div style="font-size:0.75rem; color:var(--mra-gray-500); text-transform:capitalize;">{t.taxpayer_type}</div>
+                </td>
+                <td class="mono" style="font-size:0.83rem; color:var(--mra-green); font-weight:600;">{t.tin}</td>
+                <td>
+                  <div class="risk-bar-wrap">
+                    <div class="risk-bar">
+                      <div class={`risk-fill risk-${t.riskLevel}`} style={`width:${t.riskScore}%`}></div>
+                    </div>
+                    <span class={`badge ${t.riskLevel === 'high' ? 'badge-red' : t.riskLevel === 'medium' ? 'badge-yellow' : 'badge-green'}`} style="font-size:0.7rem;">
+                      {t.riskScore}
+                    </span>
+                  </div>
+                </td>
+                <td style="font-size:0.88rem; text-align:center;">{t.totalReturns}</td>
+                <td class="mono" style="font-size:0.83rem;">{formatMWK(t.totalDue)}</td>
+                <td class="mono" style="font-size:0.83rem;">{formatMWK(t.totalPaid)}</td>
+                <td class={`mono`} style={`font-size:0.83rem; font-weight:700; color:${t.balance > 0 ? 'var(--mra-red)' : 'var(--mra-green)'}`}>
+                  {formatMWK(Math.abs(t.balance))}
+                  {t.balance > 0 ? ' owed' : t.balance < 0 ? ' credit' : ''}
+                </td>
+                <td>
+                  <div style="display:flex; gap:0.25rem; flex-wrap:wrap;">
+                    {t.neverFiled   && <span class="flag flag-red">No returns</span>}
+                    {t.hasOverdue   && <span class="flag flag-red">Overdue</span>}
+                    {t.hasOpenAudit && <span class="flag flag-orange">Audit open</span>}
+                    {t.hasPending   && <span class="flag flag-yellow">Pending review</span>}
+                    {t.riskLevel === 'low' && !t.neverFiled && !t.hasOverdue && (
+                      <span class="flag flag-green">Compliant</span>
+                    )}
+                  </div>
+                </td>
+                <td>
+                  <div style="display:flex; gap:0.3rem;">
+                    <a href={`/taxpayers?search=${t.tin}`} class="btn btn-ghost btn-sm">Profile</a>
+                    {t.riskLevel === 'high' && (
+                      <a href={`/audits/new`} class="btn btn-danger btn-sm">Audit</a>
+                    )}
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    ) : (
+      <div class="empty-state">
+        <div class="empty-state-icon">✅</div>
+        <h3>No {riskFilter !== 'all' ? riskFilter + ' risk' : ''} taxpayers found</h3>
+        <p>{riskFilter !== 'all' ? `No taxpayers are currently flagged as ${riskFilter} risk.` : 'No taxpayers registered yet.'}</p>
+      </div>
+    )}
+  </div>
+</DashLayout>
+
+<style>
+  .owing-banner {
+    display:flex; justify-content:space-between; align-items:center;
+    background:var(--mra-green-dark); border-radius:var(--radius);
+    padding:1.25rem 1.5rem; margin-bottom:1.25rem; flex-wrap:wrap; gap:1rem;
+  }
+  .risk-tabs { display:flex; border-bottom:2px solid var(--mra-gray-200); overflow-x:auto; }
+  .risk-tab {
+    display:flex; align-items:center; gap:0.4rem; padding:0.7rem 1.1rem;
+    font-size:0.86rem; font-weight:600; color:var(--mra-gray-500);
+    text-decoration:none; border-bottom:2px solid transparent;
+    margin-bottom:-2px; white-space:nowrap; transition:all 0.15s;
+  }
+  .risk-tab:hover { color:var(--mra-green); text-decoration:none; }
+  .risk-tab.active { color:var(--mra-green); border-bottom-color:var(--mra-green); }
+  .tab-count {
+    background:var(--mra-gray-200); color:var(--mra-gray-600);
+    font-size:0.72rem; font-weight:700; padding:0.1em 0.5em;
+    border-radius:999px; min-width:20px; text-align:center;
+  }
+  .risk-tab.active .tab-count { background:var(--mra-green-light); color:var(--mra-green); }
+  .risk-bar-wrap { display:flex; align-items:center; gap:0.4rem; min-width:80px; }
+  .risk-bar { flex:1; height:6px; background:var(--mra-gray-200); border-radius:3px; overflow:hidden; }
+  .risk-fill { height:100%; border-radius:3px; transition:width 0.3s; }
+  .risk-fill.risk-low    { background:var(--mra-green); }
+  .risk-fill.risk-medium { background:var(--mra-gold); }
+  .risk-fill.risk-high   { background:var(--mra-red); }
+  .flag {
+    font-size:0.68rem; font-weight:700; padding:0.15em 0.5em;
+    border-radius:3px; white-space:nowrap;
+  }
+  .flag-red    { background:#fee2e2; color:#991b1b; }
+  .flag-orange { background:#ffedd5; color:#9a3412; }
+  .flag-yellow { background:#fef3c7; color:#92400e; }
+  .flag-green  { background:#d1fae5; color:#065f46; }
+</style>

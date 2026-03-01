@@ -1,0 +1,270 @@
+---
+import DashLayout from '../../layouts/DashLayout.astro';
+import { createSupabaseServer, formatMWK, formatDate } from '../../lib/supabase';
+
+const supabase = createSupabaseServer(Astro.cookies);
+const { data: { session } } = await supabase.auth.getSession();
+if (!session) return Astro.redirect('/login');
+
+const { data: userProfile } = await supabase
+  .from('users').select('role').eq('id', session.user.id).single();
+const role = userProfile?.role || 'taxpayer';
+if (role === 'taxpayer') return Astro.redirect('/dashboard');
+
+const { id } = Astro.params;
+
+const { data: taxpayer, error } = await supabase
+  .from('taxpayers').select('*').eq('id', id).single();
+if (error || !taxpayer) return Astro.redirect('/taxpayers');
+
+// Load all related data in parallel
+const [
+  { data: returns },
+  { data: payments },
+  { data: audits },
+  { data: notifications },
+] = await Promise.all([
+  supabase.from('tax_returns').select('*').eq('taxpayer_id', id).order('created_at', { ascending: false }),
+  supabase.from('payments').select('*').eq('taxpayer_id', id).order('created_at', { ascending: false }),
+  supabase.from('audits').select('*').eq('taxpayer_id', id).order('created_at', { ascending: false }),
+  supabase.from('notifications').select('*').eq('taxpayer_id', id).order('created_at', { ascending: false }).limit(5),
+]);
+
+const totalDue  = (returns  || []).reduce((s, r) => s + (Number(r.amount_due) || 0), 0);
+const totalPaid = (payments || []).filter(p => p.status === 'confirmed').reduce((s, p) => s + (Number(p.amount) || 0), 0);
+const balance   = totalDue - totalPaid;
+
+const taxTypeLabel: Record<string, string> = {
+  income_tax: 'Income Tax', vat: 'VAT', withholding_tax: 'Withholding Tax',
+  corporate_tax: 'Corporate Tax', pay_as_you_earn: 'PAYE',
+};
+const statusBadge: Record<string, string> = {
+  draft: 'badge-gray', submitted: 'badge-blue', under_review: 'badge-yellow',
+  accepted: 'badge-green', rejected: 'badge-red',
+  initiated: 'badge-blue', in_progress: 'badge-yellow',
+  findings_issued: 'badge-orange', closed: 'badge-green',
+  pending: 'badge-yellow', confirmed: 'badge-green', reversed: 'badge-red',
+};
+
+// Handle verify/reject action
+let actionError = '';
+if (Astro.request.method === 'POST') {
+  const form   = await Astro.request.formData();
+  const action = form.get('_action')?.toString();
+  if (action === 'verify' || action === 'reject') {
+    const { error: e } = await supabase.from('taxpayers')
+      .update({ verification_status: action === 'verify' ? 'verified' : 'rejected' })
+      .eq('id', id);
+    if (e) actionError = e.message;
+    else return Astro.redirect(`/taxpayers/${id}?done=${action}`);
+  }
+}
+
+const done = Astro.url.searchParams.get('done');
+---
+
+<DashLayout title={taxpayer.name} activeNav="/taxpayers">
+  <div class="page-header">
+    <div>
+      <div style="display:flex; align-items:center; gap:0.75rem; flex-wrap:wrap;">
+        <h1 class="page-title" style="margin:0;">{taxpayer.name}</h1>
+        <span class={`badge ${taxpayer.verification_status === 'verified' ? 'badge-green' : taxpayer.verification_status === 'rejected' ? 'badge-red' : 'badge-yellow'}`}>
+          {taxpayer.verification_status}
+        </span>
+      </div>
+      <p class="page-subtitle">TIN: <span class="mono" style="font-weight:600;">{taxpayer.tin}</span> · {taxpayer.taxpayer_type}</p>
+    </div>
+    <a href="/taxpayers" class="btn btn-ghost">← All Taxpayers</a>
+  </div>
+
+  {done === 'verify' && <div class="alert alert-success" style="margin-bottom:1rem;">✓ Taxpayer verified.</div>}
+  {done === 'reject' && <div class="alert alert-danger"  style="margin-bottom:1rem;">✗ Taxpayer rejected.</div>}
+  {actionError       && <div class="alert alert-danger"  style="margin-bottom:1rem;">{actionError}</div>}
+
+  <!-- Financial summary strip -->
+  <div class="finance-strip">
+    <div class="finance-strip-item">
+      <div class="fs-label">Total Tax Due</div>
+      <div class="fs-value mono">{formatMWK(totalDue)}</div>
+    </div>
+    <div class="finance-strip-item">
+      <div class="fs-label">Total Paid</div>
+      <div class="fs-value mono green">{formatMWK(totalPaid)}</div>
+    </div>
+    <div class={`finance-strip-item ${balance > 0 ? 'owing' : ''}`}>
+      <div class="fs-label">Balance</div>
+      <div class={`fs-value mono ${balance > 0 ? 'red' : 'green'}`}>{formatMWK(Math.abs(balance))} {balance > 0 ? 'owed' : balance < 0 ? 'credit' : ''}</div>
+    </div>
+    <div class="finance-strip-item">
+      <div class="fs-label">Returns Filed</div>
+      <div class="fs-value">{(returns || []).length}</div>
+    </div>
+    <div class="finance-strip-item">
+      <div class="fs-label">Active Audits</div>
+      <div class="fs-value">{(audits || []).filter(a => a.status !== 'closed').length}</div>
+    </div>
+  </div>
+
+  <div class="detail-layout">
+    <div>
+      <!-- Returns -->
+      <div class="card section-card">
+        <div class="section-head">
+          <h2>Tax Returns</h2>
+          <span class="badge badge-gray">{(returns || []).length}</span>
+        </div>
+        {(returns || []).length > 0 ? (
+          <div class="table-wrapper">
+            <table>
+              <thead><tr><th>Reference</th><th>Type</th><th>Period</th><th>Amount Due</th><th>Status</th><th></th></tr></thead>
+              <tbody>
+                {(returns || []).map(r => (
+                  <tr>
+                    <td class="mono" style="font-size:0.82rem;">{r.return_reference}</td>
+                    <td style="font-size:0.85rem;">{taxTypeLabel[r.tax_type] || r.tax_type}</td>
+                    <td class="text-sm text-muted">{formatDate(r.period_from)} – {formatDate(r.period_to)}</td>
+                    <td class="mono">{formatMWK(r.amount_due || 0)}</td>
+                    <td><span class={`badge ${statusBadge[r.status] || 'badge-gray'}`}>{r.status.replace(/_/g,' ')}</span></td>
+                    <td><a href={`/returns/${r.id}`} class="btn btn-ghost btn-sm">View</a></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : <p class="text-muted text-sm" style="padding:1rem 0;">No returns filed.</p>}
+      </div>
+
+      <!-- Payments -->
+      <div class="card section-card">
+        <div class="section-head">
+          <h2>Payments</h2>
+          <span class="badge badge-gray">{(payments || []).length}</span>
+        </div>
+        {(payments || []).length > 0 ? (
+          <div class="table-wrapper">
+            <table>
+              <thead><tr><th>Reference</th><th>Amount</th><th>Method</th><th>Date</th><th>Status</th></tr></thead>
+              <tbody>
+                {(payments || []).map(p => (
+                  <tr>
+                    <td class="mono" style="font-size:0.82rem;">{p.payment_reference}</td>
+                    <td class="mono">{formatMWK(p.amount)}</td>
+                    <td style="font-size:0.85rem; text-transform:capitalize;">{p.payment_method?.replace('_',' ')}</td>
+                    <td class="text-sm text-muted">{formatDate(p.payment_date)}</td>
+                    <td><span class={`badge ${statusBadge[p.status] || 'badge-gray'}`}>{p.status}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : <p class="text-muted text-sm" style="padding:1rem 0;">No payments recorded.</p>}
+      </div>
+
+      <!-- Audits -->
+      <div class="card section-card">
+        <div class="section-head">
+          <h2>Audit Cases</h2>
+          <a href={`/audits/new`} class="btn btn-ghost btn-sm">+ New Audit</a>
+        </div>
+        {(audits || []).length > 0 ? (
+          <div class="table-wrapper">
+            <table>
+              <thead><tr><th>Reference</th><th>Type</th><th>Period</th><th>Risk</th><th>Status</th><th></th></tr></thead>
+              <tbody>
+                {(audits || []).map(a => (
+                  <tr>
+                    <td class="mono" style="font-size:0.82rem;">{a.audit_reference}</td>
+                    <td style="font-size:0.85rem; text-transform:capitalize;">{a.audit_type}</td>
+                    <td class="text-sm text-muted">{formatDate(a.period_from)} – {formatDate(a.period_to)}</td>
+                    <td>{a.risk_level ? <span class={`badge ${a.risk_level === 'high' ? 'badge-red' : a.risk_level === 'medium' ? 'badge-yellow' : 'badge-green'}`}>{a.risk_level}</span> : '—'}</td>
+                    <td><span class={`badge ${statusBadge[a.status] || 'badge-gray'}`}>{a.status.replace(/_/g,' ')}</span></td>
+                    <td><a href={`/audits/${a.id}`} class="btn btn-ghost btn-sm">View</a></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : <p class="text-muted text-sm" style="padding:1rem 0;">No audit cases.</p>}
+      </div>
+    </div>
+
+    <!-- Sidebar -->
+    <div>
+      <!-- Profile card -->
+      <div class="card profile-card">
+        <div class="tin-block">
+          <div class="tin-label">TIN</div>
+          <div class="tin-value mono">{taxpayer.tin}</div>
+        </div>
+        <div class="detail-row"><span class="detail-label">Type</span><span class="detail-value" style="text-transform:capitalize;">{taxpayer.taxpayer_type}</span></div>
+        {taxpayer.business_name && <div class="detail-row"><span class="detail-label">Business</span><span class="detail-value">{taxpayer.business_name}</span></div>}
+        <div class="detail-row"><span class="detail-label">Email</span><span class="detail-value" style="font-size:0.8rem;">{taxpayer.email}</span></div>
+        <div class="detail-row"><span class="detail-label">Phone</span><span class="detail-value">{taxpayer.phone || '—'}</span></div>
+        <div class="detail-row"><span class="detail-label">Address</span><span class="detail-value" style="max-width:130px; text-align:right; font-size:0.8rem;">{taxpayer.address || '—'}</span></div>
+        <div class="detail-row"><span class="detail-label">Registered</span><span class="detail-value">{formatDate(taxpayer.registration_date)}</span></div>
+        {taxpayer.nrc_number && <div class="detail-row"><span class="detail-label">NRC</span><span class="detail-value mono" style="font-size:0.8rem;">{taxpayer.nrc_number}</span></div>}
+        {taxpayer.company_reg_number && <div class="detail-row"><span class="detail-label">Reg. No.</span><span class="detail-value mono" style="font-size:0.8rem;">{taxpayer.company_reg_number}</span></div>}
+      </div>
+
+      <!-- Verification actions -->
+      {taxpayer.verification_status !== 'verified' && (
+        <div class="card" style="margin-top:1rem; padding:1.25rem;">
+          <h3 style="font-size:0.78rem; text-transform:uppercase; letter-spacing:0.07em; color:var(--mra-gray-500); margin-bottom:0.75rem;">Verification</h3>
+          <form method="POST" style="display:flex; flex-direction:column; gap:0.5rem;">
+            <button type="submit" name="_action" value="verify" class="btn btn-primary btn-sm">✓ Verify Taxpayer</button>
+            {taxpayer.verification_status !== 'rejected' && (
+              <button type="submit" name="_action" value="reject" class="btn btn-danger btn-sm"
+                onclick="return confirm('Reject this taxpayer?')">✗ Reject</button>
+            )}
+          </form>
+        </div>
+      )}
+
+      <!-- Recent notifications -->
+      {(notifications || []).length > 0 && (
+        <div class="card" style="margin-top:1rem; padding:1.25rem;">
+          <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:0.75rem;">
+            <h3 style="font-size:0.78rem; text-transform:uppercase; letter-spacing:0.07em; color:var(--mra-gray-500); margin:0;">Recent Notifications</h3>
+            <a href="/notifications" class="btn btn-ghost btn-sm" style="font-size:0.72rem;">View all</a>
+          </div>
+          {(notifications || []).map(n => (
+            <div style="padding:0.5rem 0; border-bottom:1px dashed var(--mra-gray-100);">
+              <div style="font-size:0.82rem; font-weight:600;">{n.subject}</div>
+              <div style="font-size:0.75rem; color:var(--mra-gray-500);">{formatDate(n.created_at)}</div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  </div>
+</DashLayout>
+
+<style>
+  .finance-strip {
+    display:flex; gap:0; margin-bottom:1.5rem;
+    background:#fff; border:1px solid var(--mra-gray-200);
+    border-radius:var(--radius); overflow:hidden;
+  }
+  .finance-strip-item {
+    flex:1; padding:1rem 1.25rem;
+    border-right:1px solid var(--mra-gray-200);
+  }
+  .finance-strip-item:last-child { border-right:none; }
+  .finance-strip-item.owing { background:var(--mra-red-light); }
+  .fs-label { font-size:0.72rem; text-transform:uppercase; letter-spacing:0.06em; color:var(--mra-gray-500); margin-bottom:0.3rem; }
+  .fs-value { font-size:1rem; font-weight:700; color:var(--mra-gray-900); }
+  .fs-value.green { color:var(--mra-green); }
+  .fs-value.red   { color:var(--mra-red); }
+
+  .detail-layout { display:grid; grid-template-columns:1fr 260px; gap:1.5rem; align-items:start; }
+  @media (max-width:900px) { .detail-layout { grid-template-columns:1fr; } }
+
+  .section-card { padding:1.25rem; margin-bottom:1.25rem; }
+  .section-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:1rem; }
+  .section-head h2 { font-size:0.9rem; font-weight:700; margin:0; color:var(--mra-gray-900); }
+
+  .profile-card { padding:1.25rem; }
+  .tin-block { background:var(--mra-green-dark); border-radius:var(--radius); padding:0.85rem 1rem; margin-bottom:1rem; }
+  .tin-label { font-size:0.65rem; text-transform:uppercase; letter-spacing:0.1em; color:rgba(255,255,255,0.6); margin-bottom:0.2rem; }
+  .tin-value { font-size:1.15rem; font-weight:700; color:var(--mra-gold); letter-spacing:0.05em; }
+</style>

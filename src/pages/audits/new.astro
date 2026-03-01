@@ -1,0 +1,305 @@
+---
+import DashLayout from '../../layouts/DashLayout.astro';
+import { createSupabaseServer, formatDate } from '../../lib/supabase';
+
+const supabase = createSupabaseServer(Astro.cookies);
+const { data: { session } } = await supabase.auth.getSession();
+if (!session) return Astro.redirect('/login');
+
+const { data: userProfile } = await supabase
+  .from('users').select('*').eq('id', session.user.id).single();
+const role = userProfile?.role || 'taxpayer';
+if (role === 'taxpayer') return Astro.redirect('/dashboard');
+
+// Load all taxpayers for selection
+const { data: taxpayers } = await supabase
+  .from('taxpayers')
+  .select('id, tin, name, taxpayer_type')
+  .order('name');
+
+let errorMessage = '';
+let fieldErrors: Record<string, string> = {};
+
+if (Astro.request.method === 'POST') {
+  const form = await Astro.request.formData();
+
+  const taxpayerId  = form.get('taxpayer_id')?.toString() || '';
+  const auditType   = form.get('audit_type')?.toString()  || '';
+  const reason      = form.get('reason')?.toString().trim() || '';
+  const periodFrom  = form.get('period_from')?.toString() || '';
+  const periodTo    = form.get('period_to')?.toString()   || '';
+  const riskLevel   = form.get('risk_level')?.toString()  || 'medium';
+  const startDate   = form.get('start_date')?.toString()  || new Date().toISOString().split('T')[0];
+
+  if (!taxpayerId) fieldErrors.taxpayer_id = 'Please select a taxpayer.';
+  if (!auditType)  fieldErrors.audit_type  = 'Please select an audit type.';
+  if (!reason)     fieldErrors.reason      = 'Reason for audit is required.';
+  if (!periodFrom) fieldErrors.period_from = 'Audit period start is required.';
+  if (!periodTo)   fieldErrors.period_to   = 'Audit period end is required.';
+
+  if (Object.keys(fieldErrors).length === 0) {
+    const year    = new Date().getFullYear();
+    const randNum = Math.floor(Math.random() * 900000) + 100000;
+    const auditReference = `AUD-${year}-${randNum}`;
+
+    const { data: newAudit, error } = await supabase
+      .from('audits')
+      .insert({
+        taxpayer_id:          taxpayerId,
+        assigned_officer_id:  session.user.id,
+        initiated_by:         session.user.id,
+        audit_reference:      auditReference,
+        audit_type:           auditType,
+        reason,
+        period_from:          periodFrom,
+        period_to:            periodTo,
+        risk_level:           riskLevel,
+        start_date:           startDate,
+        status:               'initiated',
+        taxpayer_notified_at: null,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      errorMessage = error.message;
+    } else {
+      await supabase.from('audit_logs').insert({
+        user_id:    session.user.id,
+        action:     'CREATE',
+        table_name: 'audits',
+        record_id:  newAudit.id,
+        new_values: { audit_reference: auditReference, taxpayer_id: taxpayerId, audit_type: auditType },
+      });
+      return Astro.redirect(`/audits/${newAudit.id}?new=1`);
+    }
+  }
+}
+
+const today = new Date().toISOString().split('T')[0];
+---
+
+<DashLayout title="Initiate Audit" activeNav="/audits">
+  <div class="page-header">
+    <div>
+      <h1 class="page-title">Initiate Audit Case</h1>
+      <p class="page-subtitle">Open a new audit investigation for a taxpayer</p>
+    </div>
+    <a href="/audits" class="btn btn-ghost">← Back to Audits</a>
+  </div>
+
+  <div class="audit-layout">
+    <div>
+      {errorMessage && <div class="alert alert-danger" style="margin-bottom:1.25rem;">{errorMessage}</div>}
+
+      <form method="POST">
+
+        <!-- Taxpayer selection -->
+        <div class="card form-section">
+          <div class="section-header">
+            <div class="section-num">1</div>
+            <div>
+              <h2 class="section-title">Select Taxpayer</h2>
+              <p class="section-desc">Choose the taxpayer this audit applies to.</p>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label required" for="taxpayer_id">Taxpayer</label>
+            <select id="taxpayer_id" name="taxpayer_id"
+              class={`form-control ${fieldErrors.taxpayer_id ? 'is-invalid' : ''}`}
+              required onchange="updateTaxpayerInfo(this)">
+              <option value="">— Select taxpayer —</option>
+              {taxpayers?.map(t => (
+                <option value={t.id} data-tin={t.tin} data-type={t.taxpayer_type}>
+                  {t.tin} · {t.name} ({t.taxpayer_type})
+                </option>
+              ))}
+            </select>
+            {fieldErrors.taxpayer_id && <p class="form-error">{fieldErrors.taxpayer_id}</p>}
+          </div>
+
+          <div id="taxpayer-preview" class="taxpayer-preview" style="display:none;">
+            <span class="mono" id="preview-tin"></span>
+            <span class="badge badge-blue" id="preview-type"></span>
+          </div>
+        </div>
+
+        <!-- Audit details -->
+        <div class="card form-section" style="margin-top:1.25rem;">
+          <div class="section-header">
+            <div class="section-num">2</div>
+            <div>
+              <h2 class="section-title">Audit Details</h2>
+              <p class="section-desc">Specify the type, period and reason for the audit.</p>
+            </div>
+          </div>
+
+          <div class="two-col">
+            <div class="form-group">
+              <label class="form-label required">Audit Type</label>
+              <div class="type-grid">
+                {[
+                  { value: 'desk',    label: 'Desk',    icon: '🗂️', desc: 'Document review' },
+                  { value: 'field',   label: 'Field',   icon: '🏢', desc: 'On-site visit' },
+                  { value: 'special', label: 'Special', icon: '⚡', desc: 'Targeted review' },
+                ].map(t => (
+                  <label class="type-option">
+                    <input type="radio" name="audit_type" value={t.value} required />
+                    <div class="type-option-inner">
+                      <span class="type-icon">{t.icon}</span>
+                      <span class="type-label">{t.label}</span>
+                      <span class="type-desc">{t.desc}</span>
+                    </div>
+                  </label>
+                ))}
+              </div>
+              {fieldErrors.audit_type && <p class="form-error">{fieldErrors.audit_type}</p>}
+            </div>
+
+            <div class="form-group">
+              <label class="form-label required">Risk Level</label>
+              <div class="risk-grid">
+                {[
+                  { value: 'low',    label: 'Low',    color: 'green' },
+                  { value: 'medium', label: 'Medium', color: 'gold' },
+                  { value: 'high',   label: 'High',   color: 'red' },
+                ].map(r => (
+                  <label class="risk-option">
+                    <input type="radio" name="risk_level" value={r.value} checked={r.value === 'medium'} />
+                    <div class={`risk-option-inner risk-${r.color}`}>{r.label}</div>
+                  </label>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div class="two-col">
+            <div class="form-group">
+              <label class="form-label required" for="period_from">Audit Period Start</label>
+              <input id="period_from" type="date" name="period_from"
+                class={`form-control ${fieldErrors.period_from ? 'is-invalid' : ''}`} required />
+              {fieldErrors.period_from && <p class="form-error">{fieldErrors.period_from}</p>}
+            </div>
+            <div class="form-group">
+              <label class="form-label required" for="period_to">Audit Period End</label>
+              <input id="period_to" type="date" name="period_to"
+                class={`form-control ${fieldErrors.period_to ? 'is-invalid' : ''}`} required />
+              {fieldErrors.period_to && <p class="form-error">{fieldErrors.period_to}</p>}
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label required" for="reason">Reason for Audit</label>
+            <textarea id="reason" name="reason" rows="3"
+              class={`form-control ${fieldErrors.reason ? 'is-invalid' : ''}`}
+              placeholder="Describe the reason for initiating this audit..." required></textarea>
+            {fieldErrors.reason && <p class="form-error">{fieldErrors.reason}</p>}
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="start_date">Start Date</label>
+            <input id="start_date" type="date" name="start_date"
+              class="form-control" value={today} />
+          </div>
+        </div>
+
+        <div class="card form-section" style="margin-top:1.25rem;">
+          <div class="alert alert-warning" style="margin-bottom:1rem;">
+            ⚠️ Initiating an audit will create a formal case. The taxpayer can be notified from the case detail page.
+          </div>
+          <div style="display:flex; gap:0.75rem;">
+            <button type="submit" class="btn btn-primary btn-lg">Initiate Audit Case →</button>
+            <a href="/audits" class="btn btn-ghost btn-lg">Cancel</a>
+          </div>
+        </div>
+
+      </form>
+    </div>
+
+    <!-- Info panel -->
+    <div>
+      <div class="card" style="padding:1.25rem; position:sticky; top:1.5rem;">
+        <h3 style="font-size:0.8rem; text-transform:uppercase; letter-spacing:0.08em; color:var(--mra-gray-500); margin-bottom:1rem;">Audit Types Guide</h3>
+        <div class="guide-item">
+          <strong>🗂️ Desk Audit</strong>
+          <p>Review of submitted documents and returns without physical visit. Most common type.</p>
+        </div>
+        <div class="guide-item">
+          <strong>🏢 Field Audit</strong>
+          <p>Physical visit to taxpayer premises to verify records and operations on-site.</p>
+        </div>
+        <div class="guide-item">
+          <strong>⚡ Special Audit</strong>
+          <p>Targeted investigation triggered by specific risk indicators or referrals.</p>
+        </div>
+        <hr class="divider" />
+        <h3 style="font-size:0.8rem; text-transform:uppercase; letter-spacing:0.08em; color:var(--mra-gray-500); margin-bottom:0.75rem;">Case Workflow</h3>
+        <div class="workflow">
+          {['Initiated', 'In Progress', 'Findings Issued', 'Closed'].map((s, i) => (
+            <div class="workflow-step">
+              <div class="workflow-dot">{i + 1}</div>
+              <span>{s}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  </div>
+</DashLayout>
+
+<style>
+  .audit-layout { display:grid; grid-template-columns:1fr 260px; gap:1.5rem; align-items:start; }
+  @media (max-width:900px) { .audit-layout { grid-template-columns:1fr; } }
+  .form-section { padding:1.5rem; }
+  .section-header { display:flex; align-items:flex-start; gap:1rem; margin-bottom:1.5rem; padding-bottom:1rem; border-bottom:1px solid var(--mra-gray-200); }
+  .section-num { width:32px; height:32px; border-radius:50%; background:var(--mra-green); color:#fff; font-weight:700; font-size:0.9rem; display:flex; align-items:center; justify-content:center; flex-shrink:0; }
+  .section-title { font-size:1rem; margin:0 0 0.2rem; }
+  .section-desc  { font-size:0.83rem; color:var(--mra-gray-500); margin:0; }
+  .is-invalid { border-color:var(--mra-red) !important; }
+
+  .taxpayer-preview { display:flex; align-items:center; gap:0.75rem; padding:0.75rem 1rem; background:var(--mra-green-light); border-radius:var(--radius); margin-top:0.5rem; }
+
+  .type-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:0.6rem; margin-top:0.5rem; }
+  .type-option input[type="radio"] { display:none; }
+  .type-option-inner { display:flex; flex-direction:column; align-items:center; gap:0.25rem; padding:0.8rem 0.5rem; border:2px solid var(--mra-gray-200); border-radius:var(--radius); cursor:pointer; transition:all 0.15s; text-align:center; }
+  .type-option:hover .type-option-inner { border-color:var(--mra-green); background:var(--mra-green-light); }
+  .type-option input:checked + .type-option-inner { border-color:var(--mra-green); background:var(--mra-green-light); box-shadow:0 0 0 3px rgba(0,90,48,0.1); }
+  .type-icon  { font-size:1.3rem; }
+  .type-label { font-size:0.82rem; font-weight:700; color:var(--mra-gray-900); }
+  .type-desc  { font-size:0.7rem; color:var(--mra-gray-500); }
+
+  .risk-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:0.6rem; margin-top:0.5rem; }
+  .risk-option input[type="radio"] { display:none; }
+  .risk-option-inner { padding:0.6rem; border:2px solid var(--mra-gray-200); border-radius:var(--radius); cursor:pointer; transition:all 0.15s; text-align:center; font-size:0.85rem; font-weight:700; }
+  .risk-option input:checked + .risk-green { border-color:var(--mra-green); background:#d1fae5; color:#065f46; }
+  .risk-option input:checked + .risk-gold  { border-color:var(--mra-gold);  background:#fef3c7; color:#92400e; }
+  .risk-option input:checked + .risk-red   { border-color:var(--mra-red);   background:#fee2e2; color:#991b1b; }
+  .risk-green:hover { border-color:var(--mra-green); }
+  .risk-gold:hover  { border-color:var(--mra-gold); }
+  .risk-red:hover   { border-color:var(--mra-red); }
+
+  .guide-item { margin-bottom:1rem; }
+  .guide-item strong { font-size:0.88rem; }
+  .guide-item p { font-size:0.8rem; color:var(--mra-gray-500); margin:0.2rem 0 0; line-height:1.4; }
+
+  .workflow { display:flex; flex-direction:column; gap:0.5rem; }
+  .workflow-step { display:flex; align-items:center; gap:0.6rem; font-size:0.83rem; color:var(--mra-gray-700); }
+  .workflow-dot { width:22px; height:22px; border-radius:50%; background:var(--mra-green); color:#fff; font-size:0.7rem; font-weight:700; display:flex; align-items:center; justify-content:center; flex-shrink:0; }
+</style>
+
+<script>
+  function updateTaxpayerInfo(select: HTMLSelectElement) {
+    const opt     = select.options[select.selectedIndex];
+    const preview = document.getElementById('taxpayer-preview')!;
+    const tinEl   = document.getElementById('preview-tin')!;
+    const typeEl  = document.getElementById('preview-type')!;
+    if (select.value) {
+      tinEl.textContent  = opt.dataset.tin  || '';
+      typeEl.textContent = opt.dataset.type || '';
+      preview.style.display = 'flex';
+    } else {
+      preview.style.display = 'none';
+    }
+  }
+</script>

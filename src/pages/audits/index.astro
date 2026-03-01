@@ -1,0 +1,205 @@
+---
+import DashLayout from '../../layouts/DashLayout.astro';
+import { createSupabaseServer, formatDate } from '../../lib/supabase';
+
+const supabase = createSupabaseServer(Astro.cookies);
+const { data: { session } } = await supabase.auth.getSession();
+if (!session) return Astro.redirect('/login');
+
+const { data: userProfile } = await supabase
+  .from('users').select('*').eq('id', session.user.id).single();
+const role = userProfile?.role || 'taxpayer';
+
+const statusFilter = Astro.url.searchParams.get('status') || 'all';
+const typeFilter   = Astro.url.searchParams.get('type')   || 'all';
+
+let query;
+
+if (role === 'taxpayer') {
+  const { data: taxpayer } = await supabase
+    .from('taxpayers').select('id').eq('user_id', session.user.id).single();
+  if (!taxpayer) return Astro.redirect('/profile/setup');
+
+  query = supabase
+    .from('audits')
+    .select('*, taxpayers(tin, name)')
+    .eq('taxpayer_id', taxpayer.id)
+    .order('created_at', { ascending: false });
+} else {
+  query = supabase
+    .from('audits')
+    .select('*, taxpayers(tin, name), users!audits_assigned_officer_id_fkey(full_name)')
+    .order('created_at', { ascending: false })
+    .limit(100);
+}
+
+if (statusFilter !== 'all') query = query.eq('status', statusFilter);
+if (typeFilter   !== 'all') query = query.eq('audit_type', typeFilter);
+
+const { data: audits } = await query;
+const all = audits || [];
+
+const counts = {
+  all:           all.length,
+  initiated:     all.filter(a => a.status === 'initiated').length,
+  in_progress:   all.filter(a => a.status === 'in_progress').length,
+  findings_issued: all.filter(a => a.status === 'findings_issued').length,
+  closed:        all.filter(a => a.status === 'closed').length,
+};
+
+const statusBadge: Record<string, string> = {
+  initiated:       'badge-blue',
+  in_progress:     'badge-yellow',
+  findings_issued: 'badge-orange',
+  closed:          'badge-green',
+  appealed:        'badge-red',
+};
+
+const riskBadge: Record<string, string> = {
+  low:    'badge-green',
+  medium: 'badge-yellow',
+  high:   'badge-red',
+};
+
+const typeLabel: Record<string, string> = {
+  desk:    'Desk Audit',
+  field:   'Field Audit',
+  special: 'Special Audit',
+};
+---
+
+<DashLayout title="Audits" activeNav="/audits">
+  <div class="page-header">
+    <div>
+      <h1 class="page-title">Audit Cases</h1>
+      <p class="page-subtitle">
+        {role === 'taxpayer' ? 'Audit cases related to your account' : 'Manage and track all audit cases'}
+      </p>
+    </div>
+    {role !== 'taxpayer' && (
+      <a href="/audits/new" class="btn btn-primary">+ Initiate Audit</a>
+    )}
+  </div>
+
+  <!-- Status tabs -->
+  <div class="status-tabs">
+    {[
+      { key: 'all',             label: 'All' },
+      { key: 'initiated',       label: 'Initiated' },
+      { key: 'in_progress',     label: 'In Progress' },
+      { key: 'findings_issued', label: 'Findings Issued' },
+      { key: 'closed',          label: 'Closed' },
+    ].map(tab => (
+      <a
+        href={`/audits?status=${tab.key}${typeFilter !== 'all' ? `&type=${typeFilter}` : ''}`}
+        class={`status-tab ${statusFilter === tab.key ? 'active' : ''}`}
+      >
+        {tab.label}
+        <span class="tab-count">{counts[tab.key as keyof typeof counts] ?? all.length}</span>
+      </a>
+    ))}
+  </div>
+
+  <div class="filters-row">
+    <div class="filter-group">
+      <label class="filter-label">Audit Type</label>
+      <select class="filter-select"
+        onchange={`window.location='/audits?status=${statusFilter}&type='+this.value`}>
+        <option value="all"     selected={typeFilter === 'all'}>All Types</option>
+        <option value="desk"    selected={typeFilter === 'desk'}>Desk Audit</option>
+        <option value="field"   selected={typeFilter === 'field'}>Field Audit</option>
+        <option value="special" selected={typeFilter === 'special'}>Special Audit</option>
+      </select>
+    </div>
+    <div class="filter-meta">Showing <strong>{all.length}</strong> audit{all.length !== 1 ? 's' : ''}</div>
+  </div>
+
+  <div class="card" style="padding:0; margin-top:1rem;">
+    {all.length > 0 ? (
+      <div class="table-wrapper" style="border:none;">
+        <table>
+          <thead>
+            <tr>
+              <th>Case No.</th>
+              {role !== 'taxpayer' && <th>Taxpayer</th>}
+              <th>Type</th>
+              <th>Period</th>
+              <th>Risk</th>
+              <th>Officer</th>
+              <th>Started</th>
+              <th>Status</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {all.map((a: any) => (
+              <tr>
+                <td class="mono" style="font-weight:700; font-size:0.85rem; color:var(--mra-green);">{a.audit_reference}</td>
+                {role !== 'taxpayer' && (
+                  <td>
+                    <div style="font-weight:600; font-size:0.88rem;">{a.taxpayers?.name || '—'}</div>
+                    <div class="mono" style="font-size:0.75rem; color:var(--mra-gray-500);">{a.taxpayers?.tin || '—'}</div>
+                  </td>
+                )}
+                <td><span class="badge badge-blue">{typeLabel[a.audit_type] || a.audit_type}</span></td>
+                <td class="text-sm text-muted">
+                  {a.period_from ? formatDate(a.period_from) : '—'}
+                  {a.period_to ? <><br/><span style="font-size:0.72rem;">to {formatDate(a.period_to)}</span></> : ''}
+                </td>
+                <td>
+                  {a.risk_level
+                    ? <span class={`badge ${riskBadge[a.risk_level] || 'badge-gray'}`}>{a.risk_level}</span>
+                    : '—'}
+                </td>
+                <td style="font-size:0.85rem;">{a.users?.full_name || '—'}</td>
+                <td class="text-sm text-muted">{formatDate(a.start_date)}</td>
+                <td>
+                  <span class={`badge ${statusBadge[a.status] || 'badge-gray'}`}>
+                    {a.status.replace(/_/g, ' ')}
+                  </span>
+                </td>
+                <td><a href={`/audits/${a.id}`} class="btn btn-ghost btn-sm">View</a></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    ) : (
+      <div class="empty-state">
+        <div class="empty-state-icon">🔍</div>
+        <h3>No audit cases found</h3>
+        <p>{role === 'taxpayer' ? 'You have no active or past audit cases.' : 'No audits have been initiated yet.'}</p>
+        {role !== 'taxpayer' && <a href="/audits/new" class="btn btn-primary btn-sm">Initiate First Audit</a>}
+      </div>
+    )}
+  </div>
+</DashLayout>
+
+<style>
+  .status-tabs { display:flex; border-bottom:2px solid var(--mra-gray-200); overflow-x:auto; }
+  .status-tab {
+    display:flex; align-items:center; gap:0.4rem; padding:0.7rem 1.1rem;
+    font-size:0.86rem; font-weight:600; color:var(--mra-gray-500);
+    text-decoration:none; border-bottom:2px solid transparent;
+    margin-bottom:-2px; white-space:nowrap; transition:all 0.15s;
+  }
+  .status-tab:hover { color:var(--mra-green); text-decoration:none; }
+  .status-tab.active { color:var(--mra-green); border-bottom-color:var(--mra-green); }
+  .tab-count {
+    background:var(--mra-gray-200); color:var(--mra-gray-600);
+    font-size:0.72rem; font-weight:700; padding:0.1em 0.5em;
+    border-radius:999px; min-width:20px; text-align:center;
+  }
+  .status-tab.active .tab-count { background:var(--mra-green-light); color:var(--mra-green); }
+  .filters-row { display:flex; align-items:center; justify-content:space-between; padding:0.75rem 0; flex-wrap:wrap; gap:0.75rem; }
+  .filter-group { display:flex; align-items:center; gap:0.5rem; }
+  .filter-label { font-size:0.82rem; font-weight:600; color:var(--mra-gray-500); }
+  .filter-select {
+    padding:0.35rem 2rem 0.35rem 0.7rem; border:1.5px solid var(--mra-gray-300);
+    border-radius:var(--radius); font-size:0.85rem; font-family:var(--font-sans);
+    color:var(--mra-gray-900); appearance:none; cursor:pointer;
+    background:#fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%23666' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 0.6rem center;
+  }
+  .filter-select:focus { outline:none; border-color:var(--mra-green); }
+  .filter-meta { font-size:0.83rem; color:var(--mra-gray-500); }
+</style>
