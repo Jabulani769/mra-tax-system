@@ -6,291 +6,357 @@ const supabase = createSupabaseServer(Astro.cookies);
 const { data: { session } } = await supabase.auth.getSession();
 if (!session) return Astro.redirect('/login');
 
-const { data: userProfile } = await supabase.from('users').select('*').eq('id', session.user.id).single();
+const { data: userProfile } = await supabase
+  .from('users').select('*').eq('id', session.user.id).single();
+
 const role = userProfile?.role || 'taxpayer';
 
-let stats: any = {};
-let recentReturns: any[] = [];
-let recentPayments: any[] = [];
+// Taxpayer data — taxpayers.user_id links to auth user
+const { data: taxpayer } = await supabase
+  .from('taxpayers').select('*').eq('user_id', session.user.id).single();
 
-if (role === 'taxpayer') {
-  const { data: taxpayer } = await supabase.from('taxpayers').select('*').eq('user_id', session.user.id).single();
-  
-  if (taxpayer) {
-    const [returnsResult, paymentsResult, notifResult] = await Promise.all([
-      supabase.from('tax_returns').select('*').eq('taxpayer_id', taxpayer.id).order('created_at', { ascending: false }).limit(5),
-      supabase.from('payments').select('*').eq('taxpayer_id', taxpayer.id).order('created_at', { ascending: false }).limit(5),
-      supabase.from('notifications').select('*').eq('taxpayer_id', taxpayer.id).eq('is_read', false),
-    ]);
-    recentReturns = returnsResult.data || [];
-    recentPayments = paymentsResult.data || [];
-    
-    const totalDue = recentReturns.reduce((sum: number, r: any) => sum + (r.amount_due || 0), 0);
-    const totalPaid = recentReturns.reduce((sum: number, r: any) => sum + (r.amount_paid || 0), 0);
-    stats = {
-      totalReturns: recentReturns.length,
-      pendingReturns: recentReturns.filter((r: any) => ['submitted','under_review'].includes(r.status)).length,
-      amountDue: totalDue,
-      amountPaid: totalPaid,
-      balance: totalDue - totalPaid,
-      unreadNotifs: notifResult.data?.length || 0,
-      tin: taxpayer.tin,
-      taxpayerStatus: taxpayer.status,
-    };
-  }
-} else {
-  const [tpResult, returnResult, payResult, auditResult] = await Promise.all([
-    supabase.from('taxpayers').select('count', { count: 'exact', head: true }),
-    supabase.from('tax_returns').select('count', { count: 'exact', head: true }).in('status', ['submitted','under_review']),
-    supabase.from('payments').select('count', { count: 'exact', head: true }).eq('status', 'pending'),
-    supabase.from('audits').select('count', { count: 'exact', head: true }).in('status', ['initiated','in_progress']),
+// Returns & payments use taxpayer.id (not user_id) as foreign key
+const taxpayerId = taxpayer?.id || null;
+
+const { data: returns } = taxpayerId ? await supabase
+  .from('tax_returns').select('*').eq('taxpayer_id', taxpayerId)
+  .order('created_at', { ascending: false }).limit(5) : { data: [] };
+
+const { data: payments } = taxpayerId ? await supabase
+  .from('payments').select('*').eq('taxpayer_id', taxpayerId)
+  .order('created_at', { ascending: false }).limit(5) : { data: [] };
+
+// Officer/admin: system-wide stats
+let systemStats = { taxpayers: 0, pendingReturns: 0, pendingPayments: 0, openAudits: 0 };
+let recentSubmissions: any[] = [];
+
+if (role !== 'taxpayer') {
+  const [{ count: tc }, { count: rc }, { count: pc }, { count: ac }] = await Promise.all([
+    supabase.from('taxpayers').select('*', { count: 'exact', head: true }),
+    supabase.from('tax_returns').select('*', { count: 'exact', head: true }).eq('status', 'submitted'),
+    supabase.from('payments').select('*', { count: 'exact', head: true }).eq('status', 'pending'),
+    supabase.from('audits').select('*', { count: 'exact', head: true }).in('status', ['initiated','in_progress']),
   ]);
-  const [recentRet, recentPay] = await Promise.all([
-    supabase.from('tax_returns').select('*, taxpayers(name, tin)').order('created_at', { ascending: false }).limit(6),
-    supabase.from('payments').select('*, taxpayers(name, tin)').order('created_at', { ascending: false }).limit(5),
-  ]);
-  recentReturns = recentRet.data || [];
-  recentPayments = recentPay.data || [];
-  stats = {
-    totalTaxpayers: tpResult.count || 0,
-    pendingReturns: returnResult.count || 0,
-    pendingPayments: payResult.count || 0,
-    openAudits: auditResult.count || 0,
+  systemStats = {
+    taxpayers: tc || 0,
+    pendingReturns: rc || 0,
+    pendingPayments: pc || 0,
+    openAudits: ac || 0,
   };
+
+  const { data: recent } = await supabase
+    .from('tax_returns')
+    .select('*, taxpayers(tin, name, user_id)')
+    .order('created_at', { ascending: false })
+    .limit(8);
+  recentSubmissions = recent || [];
 }
 
-function statusBadge(status: string) {
-  const map: Record<string, string> = {
-    draft: 'badge-gray', submitted: 'badge-blue', under_review: 'badge-yellow',
-    assessed: 'badge-orange', accepted: 'badge-green', rejected: 'badge-red',
-    amended: 'badge-orange', confirmed: 'badge-green', pending: 'badge-yellow', reversed: 'badge-red',
-  };
-  return map[status] || 'badge-gray';
-}
+// Compute taxpayer totals
+const totalDue  = returns?.reduce((s: number, r: any) => s + (Number(r.amount_due) || 0), 0) || 0;
+const totalPaid = payments?.filter((p: any) => p.status === 'confirmed').reduce((s: number, p: any) => s + (Number(p.amount) || 0), 0) || 0;
+const balance   = totalDue - totalPaid;
+
+const statusBadge: Record<string, string> = {
+  draft:        'badge-gray',
+  submitted:    'badge-blue',
+  under_review: 'badge-yellow',
+  assessed:     'badge-orange',
+  accepted:     'badge-green',
+  rejected:     'badge-red',
+  amended:      'badge-orange',
+  confirmed:    'badge-green',
+  pending:      'badge-yellow',
+  reversed:     'badge-red',
+};
+
+const taxTypeLabel: Record<string, string> = {
+  income_tax: 'Income Tax',
+  vat: 'VAT',
+  withholding_tax: 'Withholding',
+  corporate_tax: 'Corporate',
+  pay_as_you_earn: 'PAYE',
+};
 ---
 
-<DashLayout title="Dashboard" activeNav="/dashboard">
-  {role === 'taxpayer' && !stats.tin && (
-    <div class="alert alert-warning" style="margin-bottom: 20px;">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-      <div>
-        <strong>Complete your taxpayer profile</strong> — Your account is not yet linked to a TIN. 
-        <a href="/profile/setup">Complete registration →</a>
-      </div>
-    </div>
-  )}
+<DashLayout
+  title={role === 'taxpayer' ? 'My Dashboard' : 'System Dashboard'}
+  activeNav="/dashboard"
+>
 
-  {role === 'taxpayer' && stats.tin && (
+  {/* ── TAXPAYER VIEW ── */}
+  {role === 'taxpayer' && (
     <div>
-      <!-- TIN Banner -->
-      <div class="tin-banner">
-        <div class="tin-info">
-          <span class="tin-label">Taxpayer ID (TIN)</span>
-          <span class="tin-number">{stats.tin}</span>
-          <span class={`badge ${stats.taxpayerStatus === 'active' ? 'badge-green' : 'badge-red'}`}>{stats.taxpayerStatus}</span>
+      {/* No profile yet */}
+      {!taxpayer && (
+        <div class="alert alert-warning" style="margin-bottom:1.5rem;">
+          ⚠️ Your taxpayer profile is incomplete. <a href="/profile/setup"><strong>Complete setup to get your TIN →</strong></a>
         </div>
-        <div class="tin-actions">
-          <a href="/returns/new" class="btn btn-primary btn-sm">+ File Return</a>
-          <a href="/payments/new" class="btn btn-secondary btn-sm">+ Record Payment</a>
-        </div>
-      </div>
+      )}
 
-      <!-- Stats -->
-      <div class="stats-grid">
-        <div class="stat-card">
-          <div class="stat-label">Total Returns Filed</div>
-          <div class="stat-value">{stats.totalReturns}</div>
-          <div class="stat-change">{stats.pendingReturns} pending review</div>
+      {/* TIN banner */}
+      {taxpayer && (
+        <div class="tin-banner">
+          <div>
+            <div class="tin-banner-label">Your Tax Identification Number</div>
+            <div class="tin-banner-number">{taxpayer.tin}</div>
+            <div class="tin-banner-sub">
+              {taxpayer.taxpayer_type.charAt(0).toUpperCase() + taxpayer.taxpayer_type.slice(1)} ·
+              Registered {formatDate(taxpayer.registration_date)}
+            </div>
+          </div>
+          <div class="tin-banner-actions">
+            <span class={`badge ${statusBadge[taxpayer.verification_status] || 'badge-gray'}`} style="font-size:0.78rem;padding:0.3em 0.8em;">
+              {taxpayer.verification_status}
+            </span>
+            <a href="/returns/new" class="btn btn-gold btn-sm">+ File Return</a>
+            <a href="/payments/new" class="btn btn-secondary btn-sm">+ Payment</a>
+          </div>
         </div>
-        <div class="stat-card">
-          <div class="stat-label">Total Amount Due</div>
-          <div class="stat-value">{formatMWK(stats.amountDue || 0)}</div>
-          <div class="stat-change">Across all returns</div>
+      )}
+
+      {/* Stats */}
+      <div class="stats-grid" style="margin-top:1.25rem;">
+        <div class="stat-card blue">
+          <div class="stat-label">Total Returns</div>
+          <div class="stat-value">{returns?.length || 0}</div>
+          <div class="stat-sub">All time</div>
         </div>
-        <div class="stat-card">
+        <div class="stat-card gold">
+          <div class="stat-label">Total Assessed</div>
+          <div class="stat-value" style="font-size:1.1rem;">{formatMWK(totalDue)}</div>
+          <div class="stat-sub">Amount due</div>
+        </div>
+        <div class="stat-card green">
           <div class="stat-label">Total Paid</div>
-          <div class="stat-value" style="color: var(--mra-green);">{formatMWK(stats.amountPaid || 0)}</div>
-          <div class="stat-change">Confirmed payments</div>
+          <div class="stat-value" style="font-size:1.1rem;">{formatMWK(totalPaid)}</div>
+          <div class="stat-sub">Confirmed payments</div>
         </div>
-        <div class="stat-card">
+        <div class={`stat-card ${balance > 0 ? 'red' : 'green'}`}>
           <div class="stat-label">Outstanding Balance</div>
-          <div class="stat-value" style={stats.balance > 0 ? 'color: var(--mra-red)' : 'color: var(--mra-green)'}>{formatMWK(stats.balance || 0)}</div>
-          <div class="stat-change">{stats.unreadNotifs} unread notifications</div>
+          <div class="stat-value" style="font-size:1.1rem;">{formatMWK(balance)}</div>
+          <div class="stat-sub">{balance > 0 ? 'Amount owing' : 'Fully paid'}</div>
         </div>
       </div>
 
-      <!-- Recent Returns -->
-      <div class="section-pair">
-        <div class="card">
-          <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
-            <h3 style="font-size:15px;">Recent Tax Returns</h3>
-            <a href="/returns" class="btn btn-ghost btn-sm">View all →</a>
-          </div>
-          <div style="overflow-x:auto;">
-            {recentReturns.length === 0 ? (
-              <div class="empty-state">No tax returns filed yet. <a href="/returns/new">File your first return</a></div>
-            ) : (
-              <table>
-                <thead><tr><th>Reference</th><th>Tax Type</th><th>Period</th><th>Amount Due</th><th>Status</th></tr></thead>
-                <tbody>
-                  {recentReturns.map((r: any) => (
-                    <tr>
-                      <td><a href={`/returns/${r.id}`} class="mono">{r.return_reference}</a></td>
-                      <td style="text-transform:capitalize;">{r.tax_type.replace(/_/g,' ')}</td>
-                      <td class="text-small text-muted">{formatDate(r.period_from)}</td>
-                      <td class="mono">{formatMWK(r.amount_due)}</td>
-                      <td><span class={`badge ${statusBadge(r.status)}`}>{r.status}</span></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-          </div>
+      {/* Recent returns */}
+      <div class="card" style="margin-top:1.25rem;">
+        <div class="page-header" style="margin-bottom:1rem;">
+          <h2 style="margin:0;font-size:1rem;">Recent Returns</h2>
+          <a href="/returns" class="btn btn-ghost btn-sm">View All</a>
         </div>
+        {returns && returns.length > 0 ? (
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>Reference</th>
+                  <th>Tax Type</th>
+                  <th>Period</th>
+                  <th>Amount Due</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {returns.map(r => (
+                  <tr>
+                    <td><a href={`/returns/${r.id}`} class="mono">{r.return_reference}</a></td>
+                    <td>{taxTypeLabel[r.tax_type] || r.tax_type}</td>
+                    <td class="text-sm text-muted">{formatDate(r.period_from)} – {formatDate(r.period_to)}</td>
+                    <td class="mono">{formatMWK(r.amount_due)}</td>
+                    <td><span class={`badge ${statusBadge[r.status] || 'badge-gray'}`}>{r.status.replace('_',' ')}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div class="empty-state">
+            <div class="empty-state-icon">📋</div>
+            <h3>No returns yet</h3>
+            <p>File your first tax return to get started.</p>
+            <a href="/returns/new" class="btn btn-primary btn-sm">File First Return</a>
+          </div>
+        )}
+      </div>
 
-        <div class="card">
-          <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
-            <h3 style="font-size:15px;">Recent Payments</h3>
-            <a href="/payments" class="btn btn-ghost btn-sm">View all →</a>
-          </div>
-          <div style="overflow-x:auto;">
-            {recentPayments.length === 0 ? (
-              <div class="empty-state">No payments recorded yet.</div>
-            ) : (
-              <table>
-                <thead><tr><th>Reference</th><th>Amount</th><th>Date</th><th>Status</th></tr></thead>
-                <tbody>
-                  {recentPayments.map((p: any) => (
-                    <tr>
-                      <td class="mono">{p.payment_reference}</td>
-                      <td class="mono">{formatMWK(p.amount)}</td>
-                      <td class="text-small text-muted">{formatDate(p.payment_date)}</td>
-                      <td><span class={`badge ${statusBadge(p.status)}`}>{p.status}</span></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-          </div>
+      {/* Recent payments */}
+      <div class="card" style="margin-top:1.25rem;">
+        <div class="page-header" style="margin-bottom:1rem;">
+          <h2 style="margin:0;font-size:1rem;">Recent Payments</h2>
+          <a href="/payments" class="btn btn-ghost btn-sm">View All</a>
         </div>
+        {payments && payments.length > 0 ? (
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>Reference</th>
+                  <th>Amount</th>
+                  <th>Method</th>
+                  <th>Date</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {payments.map(p => (
+                  <tr>
+                    <td class="mono">{p.payment_reference}</td>
+                    <td class="mono">{formatMWK(p.amount)}</td>
+                    <td style="text-transform:capitalize;">{p.payment_method?.replace('_',' ')}</td>
+                    <td class="text-sm text-muted">{formatDate(p.payment_date)}</td>
+                    <td><span class={`badge ${statusBadge[p.status] || 'badge-gray'}`}>{p.status}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div class="empty-state">
+            <div class="empty-state-icon">💳</div>
+            <h3>No payments recorded</h3>
+            <p>Record a payment once you have a tax return.</p>
+          </div>
+        )}
       </div>
     </div>
   )}
 
-  {(role === 'officer' || role === 'admin') && (
+  {/* ── OFFICER / ADMIN VIEW ── */}
+  {role !== 'taxpayer' && (
     <div>
       <div class="stats-grid">
-        <div class="stat-card">
+        <div class="stat-card blue">
           <div class="stat-label">Registered Taxpayers</div>
-          <div class="stat-value">{stats.totalTaxpayers}</div>
-          <div class="stat-change">Active taxpayer accounts</div>
+          <div class="stat-value">{systemStats.taxpayers}</div>
+          <div class="stat-sub"><a href="/taxpayers">Manage →</a></div>
         </div>
-        <div class="stat-card">
-          <div class="stat-label">Returns Pending Review</div>
-          <div class="stat-value" style="color: var(--mra-gold);">{stats.pendingReturns}</div>
-          <div class="stat-change">Requires officer assessment</div>
+        <div class="stat-card gold">
+          <div class="stat-label">Pending Returns</div>
+          <div class="stat-value">{systemStats.pendingReturns}</div>
+          <div class="stat-sub"><a href="/returns">Review →</a></div>
         </div>
-        <div class="stat-card">
+        <div class="stat-card green">
           <div class="stat-label">Pending Payments</div>
-          <div class="stat-value" style="color: var(--mra-gold);">{stats.pendingPayments}</div>
-          <div class="stat-change">Awaiting confirmation</div>
+          <div class="stat-value">{systemStats.pendingPayments}</div>
+          <div class="stat-sub"><a href="/payments">Confirm →</a></div>
         </div>
-        <div class="stat-card">
+        <div class="stat-card red">
           <div class="stat-label">Open Audits</div>
-          <div class="stat-value" style="color: var(--mra-red);">{stats.openAudits}</div>
-          <div class="stat-change">Active audit cases</div>
+          <div class="stat-value">{systemStats.openAudits}</div>
+          <div class="stat-sub"><a href="/audits">View →</a></div>
         </div>
       </div>
 
-      <div class="section-pair">
+      <div class="two-col" style="margin-top:1.25rem;">
         <div class="card">
-          <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
-            <h3 style="font-size:15px;">Recent Submissions</h3>
-            <a href="/returns" class="btn btn-ghost btn-sm">View all →</a>
+          <div class="page-header" style="margin-bottom:1rem;">
+            <h2 style="margin:0;font-size:1rem;">Recent Submissions</h2>
+            <a href="/returns" class="btn btn-ghost btn-sm">View All</a>
           </div>
-          <div style="overflow-x:auto;">
-            {recentReturns.length === 0 ? (
-              <div class="empty-state">No recent submissions.</div>
-            ) : (
+          {recentSubmissions.length > 0 ? (
+            <div class="table-wrapper">
               <table>
-                <thead><tr><th>Reference</th><th>Taxpayer</th><th>Tax Type</th><th>Amount</th><th>Status</th></tr></thead>
+                <thead>
+                  <tr>
+                    <th>Taxpayer</th>
+                    <th>TIN</th>
+                    <th>Type</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
                 <tbody>
-                  {recentReturns.map((r: any) => (
+                  {recentSubmissions.map((r: any) => (
                     <tr>
-                      <td><a href={`/returns/${r.id}`} class="mono">{r.return_reference}</a></td>
-                      <td>{r.taxpayers?.name || '—'}<br/><span class="mono text-small text-muted">{r.taxpayers?.tin}</span></td>
-                      <td style="text-transform:capitalize;">{r.tax_type.replace(/_/g,' ')}</td>
-                      <td class="mono">{formatMWK(r.amount_due)}</td>
-                      <td><span class={`badge ${statusBadge(r.status)}`}>{r.status}</span></td>
+                      <td>
+                        <div style="font-weight:600;font-size:0.88rem;">{r.taxpayers?.name || '—'}</div>
+                        <div class="text-sm text-muted">{formatDate(r.created_at)}</div>
+                      </td>
+                      <td class="mono">{r.taxpayers?.tin || '—'}</td>
+                      <td>{taxTypeLabel[r.tax_type] || r.tax_type}</td>
+                      <td><span class={`badge ${statusBadge[r.status] || 'badge-gray'}`}>{r.status.replace('_',' ')}</span></td>
                     </tr>
                   ))}
                 </tbody>
               </table>
-            )}
-          </div>
+            </div>
+          ) : (
+            <div class="empty-state">
+              <div class="empty-state-icon">📋</div>
+              <h3>No submissions yet</h3>
+              <p>Returns submitted by taxpayers will appear here.</p>
+            </div>
+          )}
         </div>
 
-        <div class="card">
-          <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
-            <h3 style="font-size:15px;">Quick Actions</h3>
-          </div>
-          <div class="quick-actions">
-            <a href="/taxpayers" class="qa-item">
-              <span class="qa-icon">◎</span>
-              <div><div class="qa-label">Manage Taxpayers</div><div class="qa-desc">View, verify & update taxpayer records</div></div>
-            </a>
-            <a href="/returns" class="qa-item">
-              <span class="qa-icon">⊡</span>
-              <div><div class="qa-label">Process Returns</div><div class="qa-desc">Review & assess submitted tax returns</div></div>
-            </a>
-            <a href="/audits/new" class="qa-item">
-              <span class="qa-icon">◧</span>
-              <div><div class="qa-label">Initiate Audit</div><div class="qa-desc">Create a new audit case for a taxpayer</div></div>
-            </a>
-            <a href="/compliance" class="qa-item">
-              <span class="qa-icon">◉</span>
-              <div><div class="qa-label">Compliance Monitor</div><div class="qa-desc">Identify non-filers & overdue payments</div></div>
-            </a>
-            {role === 'admin' && (
-              <a href="/users" class="qa-item">
-                <span class="qa-icon">◫</span>
-                <div><div class="qa-label">User Management</div><div class="qa-desc">Manage MRA staff accounts & roles</div></div>
-              </a>
-            )}
+        <div>
+          <div class="card">
+            <h2 style="margin-bottom:1rem;font-size:1rem;">Quick Actions</h2>
+            <div style="display:flex;flex-direction:column;gap:0.6rem;">
+              <a href="/taxpayers" class="btn btn-secondary">◉ Manage Taxpayers</a>
+              <a href="/returns" class="btn btn-secondary">⊡ Process Returns</a>
+              <a href="/audits/new" class="btn btn-secondary">◨ Initiate Audit</a>
+              <a href="/compliance" class="btn btn-secondary">◫ Compliance Monitor</a>
+              <a href="/reports" class="btn btn-secondary">⊟ Generate Reports</a>
+              {role === 'admin' && (
+                <a href="/users" class="btn btn-ghost">◑ User Management</a>
+              )}
+            </div>
           </div>
         </div>
       </div>
     </div>
   )}
+
 </DashLayout>
 
 <style>
-.tin-banner {
-  background: var(--mra-green-dark); color: white; padding: 16px 20px;
-  border-radius: var(--radius-md); margin-bottom: 24px;
-  display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;
-}
-.tin-info { display: flex; align-items: center; gap: 12px; }
-.tin-label { font-size: 11px; color: rgba(255,255,255,0.6); text-transform: uppercase; letter-spacing: 0.08em; }
-.tin-number { font-family: var(--font-mono); font-size: 18px; color: #FFD700; font-weight: 600; }
-.tin-actions { display: flex; gap: 8px; }
-
-.stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
-
-.section-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-@media (max-width: 900px) { .section-pair { grid-template-columns: 1fr; } }
-
-.empty-state { padding: 32px; text-align: center; color: var(--mra-gray-400); font-size: 14px; }
-
-.quick-actions { padding: 8px 0; }
-.qa-item {
-  display: flex; align-items: center; gap: 12px; padding: 12px 20px;
-  text-decoration: none; color: var(--mra-black); transition: background 0.15s;
-  border-bottom: 1px solid var(--mra-gray-100);
-}
-.qa-item:last-child { border-bottom: none; }
-.qa-item:hover { background: var(--mra-gray-50); text-decoration: none; }
-.qa-icon { font-size: 20px; width: 32px; text-align: center; color: var(--mra-green); }
-.qa-label { font-size: 14px; font-weight: 600; }
-.qa-desc { font-size: 12px; color: var(--mra-gray-400); margin-top: 2px; }
+  .tin-banner {
+    background: var(--mra-green-dark);
+    color: #fff;
+    border-radius: var(--radius);
+    padding: 1.25rem 1.5rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 1rem;
+    position: relative;
+    overflow: hidden;
+  }
+  .tin-banner::after {
+    content: '';
+    position: absolute;
+    width: 200px; height: 200px;
+    border-radius: 50%;
+    background: rgba(255,255,255,0.04);
+    right: -50px; top: -60px;
+  }
+  .tin-banner-label {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: rgba(255,255,255,0.55);
+    font-weight: 700;
+    margin-bottom: 0.2rem;
+  }
+  .tin-banner-number {
+    font-family: var(--font-mono);
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: var(--mra-gold);
+    letter-spacing: 0.05em;
+  }
+  .tin-banner-sub {
+    font-size: 0.78rem;
+    color: rgba(255,255,255,0.55);
+    margin-top: 0.2rem;
+  }
+  .tin-banner-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+    position: relative; z-index: 1;
+  }
 </style>

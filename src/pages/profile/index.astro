@@ -1,0 +1,331 @@
+---
+import DashLayout from '../../layouts/DashLayout.astro';
+import { createSupabaseServer, formatDate } from '../../lib/supabase';
+
+const supabase = createSupabaseServer(Astro.cookies);
+const { data: { session } } = await supabase.auth.getSession();
+if (!session) return Astro.redirect('/login');
+
+const isNew = Astro.url.searchParams.get('new') === '1';
+
+const { data: userProfile } = await supabase
+  .from('users')
+  .select('*')
+  .eq('id', session.user.id)
+  .single();
+
+const { data: taxpayer } = await supabase
+  .from('taxpayers')
+  .select('*')
+  .eq('user_id', session.user.id)
+  .single();
+
+// If no taxpayer profile yet, redirect to setup
+if (!taxpayer) return Astro.redirect('/profile/setup');
+
+let successMessage = '';
+let errorMessage   = '';
+
+if (Astro.request.method === 'POST') {
+  const form = await Astro.request.formData();
+  const action = form.get('_action')?.toString();
+
+  if (action === 'update_account') {
+    const fullName = form.get('full_name')?.toString().trim() || '';
+    if (fullName) {
+      const { error } = await supabase
+        .from('users')
+        .update({ full_name: fullName })
+        .eq('id', session.user.id);
+      if (error) errorMessage = error.message;
+      else successMessage = 'Account name updated.';
+    }
+  }
+
+  if (action === 'update_taxpayer') {
+    const phone       = form.get('phone')?.toString().trim() || '';
+    const address     = form.get('address')?.toString().trim() || '';
+    const businessName = form.get('business_name')?.toString().trim() || '';
+
+    const { error } = await supabase
+      .from('taxpayers')
+      .update({ phone, address, business_name: businessName || null, name: userProfile?.full_name || '' })
+      .eq('user_id', session.user.id);
+
+    if (error) errorMessage = error.message;
+    else {
+      await supabase.from('audit_logs').insert({
+        user_id:    session.user.id,
+        action:     'UPDATE',
+        table_name: 'taxpayers',
+        new_values: { phone, address },
+      });
+      successMessage = 'Taxpayer details updated successfully.';
+    }
+  }
+
+  // Refresh data after update
+  if (successMessage) {
+    return Astro.redirect('/profile?saved=1');
+  }
+}
+
+const savedMsg = Astro.url.searchParams.get('saved') === '1';
+
+const typeLabel: Record<string, string> = {
+  individual:  'Individual',
+  company:     'Company',
+  partnership: 'Partnership',
+};
+
+const verificationColors: Record<string, string> = {
+  pending:  'badge-yellow',
+  verified: 'badge-green',
+  rejected: 'badge-red',
+};
+---
+
+<DashLayout title="My Profile" activeNav="/profile">
+
+  {(savedMsg || isNew) && (
+    <div class="alert alert-success" style="margin-bottom:1.25rem;">
+      {isNew
+        ? `🎉 Welcome! Your TIN has been assigned: ${taxpayer.tin}. Your account is now active.`
+        : '✓ Profile updated successfully.'}
+    </div>
+  )}
+  {errorMessage && <div class="alert alert-danger">{errorMessage}</div>}
+
+  <div class="profile-layout">
+
+    <!-- LEFT: TIN Card + Stats -->
+    <div class="profile-sidebar">
+
+      <!-- TIN Card -->
+      <div class="tin-card">
+        <div class="tin-card-header">
+          <span class="tin-label">Tax Identification Number</span>
+          <span class={`badge ${verificationColors[taxpayer.verification_status] || 'badge-gray'}`}>
+            {taxpayer.verification_status}
+          </span>
+        </div>
+        <div class="tin-number">{taxpayer.tin}</div>
+        <div class="tin-meta">
+          <span>{typeLabel[taxpayer.taxpayer_type] || taxpayer.taxpayer_type}</span>
+          <span>·</span>
+          <span>Registered {formatDate(taxpayer.registration_date)}</span>
+        </div>
+        {taxpayer.verification_status === 'pending' && (
+          <div class="tin-pending-notice">
+            ⏳ Pending verification by MRA officer
+          </div>
+        )}
+      </div>
+
+      <!-- Quick stats -->
+      <div class="card" style="margin-top:1rem;">
+        <h3 style="font-size:0.82rem; text-transform:uppercase; letter-spacing:0.06em; color:var(--mra-gray-500); margin-bottom:1rem;">Account Summary</h3>
+        <div class="detail-row">
+          <span class="detail-label">Account Status</span>
+          <span class="detail-value">
+            <span class={userProfile?.is_active ? 'badge badge-green' : 'badge badge-red'}>
+              {userProfile?.is_active ? 'Active' : 'Inactive'}
+            </span>
+          </span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-label">Role</span>
+          <span class="detail-value" style="text-transform:capitalize;">{userProfile?.role}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-label">Member Since</span>
+          <span class="detail-value">{formatDate(userProfile?.created_at)}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-label">Last Updated</span>
+          <span class="detail-value">{formatDate(taxpayer.updated_at)}</span>
+        </div>
+      </div>
+
+      <!-- Quick links -->
+      <div class="card" style="margin-top:1rem;">
+        <h3 style="font-size:0.82rem; text-transform:uppercase; letter-spacing:0.06em; color:var(--mra-gray-500); margin-bottom:0.75rem;">Quick Actions</h3>
+        <div style="display:flex; flex-direction:column; gap:0.5rem;">
+          <a href="/returns/new" class="btn btn-primary btn-sm">+ File New Return</a>
+          <a href="/payments/new" class="btn btn-secondary btn-sm">+ Record Payment</a>
+          <a href="/dashboard" class="btn btn-ghost btn-sm">← Back to Dashboard</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT: Edit forms -->
+    <div class="profile-main">
+
+      <!-- Taxpayer details form -->
+      <div class="card">
+        <h2 style="margin-bottom:1.25rem;">Taxpayer Details</h2>
+
+        <form method="POST">
+          <input type="hidden" name="_action" value="update_taxpayer" />
+
+          <div class="form-group">
+            <label class="form-label">TIN (read-only)</label>
+            <input type="text" class="form-control" value={taxpayer.tin} disabled />
+            <p class="form-hint">Your TIN is assigned by the system and cannot be changed.</p>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Taxpayer Type (read-only)</label>
+            <input type="text" class="form-control" value={typeLabel[taxpayer.taxpayer_type]} disabled />
+          </div>
+
+          {taxpayer.taxpayer_type !== 'individual' && (
+            <div class="form-group">
+              <label class="form-label" for="business_name">Business / Organisation Name</label>
+              <input
+                id="business_name"
+                type="text"
+                name="business_name"
+                class="form-control"
+                value={taxpayer.business_name || ''}
+                placeholder="e.g. Kapherachoka Enterprises Ltd"
+              />
+            </div>
+          )}
+
+          <div class="two-col">
+            <div class="form-group">
+              <label class="form-label required" for="phone">Phone Number</label>
+              <input
+                id="phone"
+                type="tel"
+                name="phone"
+                class="form-control"
+                value={taxpayer.phone || ''}
+                placeholder="+265 999 000 000"
+                required
+              />
+            </div>
+
+            <div class="form-group">
+              <label class="form-label required" for="address">Physical Address</label>
+              <input
+                id="address"
+                type="text"
+                name="address"
+                class="form-control"
+                value={taxpayer.address || ''}
+                placeholder="e.g. Area 3, Lilongwe"
+                required
+              />
+            </div>
+          </div>
+
+          <button type="submit" class="btn btn-primary">Save Taxpayer Details</button>
+        </form>
+      </div>
+
+      <!-- Account details form -->
+      <div class="card" style="margin-top:1.25rem;">
+        <h2 style="margin-bottom:1.25rem;">Account Details</h2>
+
+        <form method="POST">
+          <input type="hidden" name="_action" value="update_account" />
+
+          <div class="form-group">
+            <label class="form-label required" for="full_name">Full Name</label>
+            <input
+              id="full_name"
+              type="text"
+              name="full_name"
+              class="form-control"
+              value={userProfile?.full_name || ''}
+              placeholder="Your full legal name"
+              required
+            />
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Email Address (read-only)</label>
+            <input
+              type="email"
+              class="form-control"
+              value={userProfile?.email || session.user.email}
+              disabled
+            />
+            <p class="form-hint">Email cannot be changed. Contact MRA Help Desk if needed.</p>
+          </div>
+
+          <button type="submit" class="btn btn-primary">Update Name</button>
+        </form>
+      </div>
+
+    </div>
+  </div>
+
+  <style>
+    .profile-layout {
+      display: grid;
+      grid-template-columns: 300px 1fr;
+      gap: 1.5rem;
+      align-items: start;
+    }
+    @media (max-width: 900px) {
+      .profile-layout { grid-template-columns: 1fr; }
+    }
+
+    /* TIN Card */
+    .tin-card {
+      background: var(--mra-green-dark);
+      color: #fff;
+      border-radius: var(--radius);
+      padding: 1.5rem;
+      position: relative;
+      overflow: hidden;
+    }
+    .tin-card::before {
+      content: '';
+      position: absolute;
+      width: 180px; height: 180px;
+      border-radius: 50%;
+      background: rgba(255,255,255,0.04);
+      top: -40px; right: -40px;
+    }
+    .tin-card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 0.75rem;
+    }
+    .tin-label {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: rgba(255,255,255,0.6);
+      font-weight: 700;
+    }
+    .tin-number {
+      font-family: var(--font-mono);
+      font-size: 1.6rem;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      color: var(--mra-gold);
+      margin-bottom: 0.5rem;
+    }
+    .tin-meta {
+      font-size: 0.78rem;
+      color: rgba(255,255,255,0.6);
+      display: flex;
+      gap: 0.4rem;
+    }
+    .tin-pending-notice {
+      margin-top: 0.85rem;
+      font-size: 0.78rem;
+      background: rgba(200,151,26,0.2);
+      border: 1px solid rgba(200,151,26,0.4);
+      border-radius: 6px;
+      padding: 0.5rem 0.75rem;
+      color: #ffe08a;
+    }
+  </style>
+</DashLayout>

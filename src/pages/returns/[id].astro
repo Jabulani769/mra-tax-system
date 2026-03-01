@@ -1,0 +1,341 @@
+---
+import DashLayout from '../../layouts/DashLayout.astro';
+import { createSupabaseServer, formatMWK, formatDate } from '../../lib/supabase';
+
+const supabase = createSupabaseServer(Astro.cookies);
+const { data: { session } } = await supabase.auth.getSession();
+if (!session) return Astro.redirect('/login');
+
+const { id } = Astro.params;
+const { data: userProfile } = await supabase
+  .from('users').select('*').eq('id', session.user.id).single();
+const role = userProfile?.role || 'taxpayer';
+
+const { data: ret, error } = await supabase
+  .from('tax_returns')
+  .select('*, taxpayers(tin, name, phone, address, verification_status, taxpayer_type)')
+  .eq('id', id)
+  .single();
+
+if (error || !ret) return Astro.redirect('/returns');
+
+// Check taxpayer owns this return (if not officer/admin)
+if (role === 'taxpayer') {
+  const { data: taxpayer } = await supabase
+    .from('taxpayers').select('id').eq('user_id', session.user.id).single();
+  if (!taxpayer || taxpayer.id !== ret.taxpayer_id) return Astro.redirect('/returns');
+}
+
+const savedMsg = Astro.url.searchParams.get('saved');
+
+let successMessage = '';
+let errorMessage   = '';
+
+// Officer/admin: process the return
+if (Astro.request.method === 'POST' && role !== 'taxpayer') {
+  const form   = await Astro.request.formData();
+  const action = form.get('_action')?.toString();
+  const notes  = form.get('officer_notes')?.toString().trim() || '';
+
+  if (action === 'accept') {
+    const { error: e } = await supabase
+      .from('tax_returns')
+      .update({ status: 'accepted', assessment_date: new Date().toISOString(), notes, officer_id: session.user.id })
+      .eq('id', id);
+    if (e) errorMessage = e.message;
+    else { successMessage = 'Return accepted.'; return Astro.redirect(`/returns/${id}?saved=accepted`); }
+  }
+
+  if (action === 'reject') {
+    const { error: e } = await supabase
+      .from('tax_returns')
+      .update({ status: 'rejected', assessment_date: new Date().toISOString(), notes, officer_id: session.user.id })
+      .eq('id', id);
+    if (e) errorMessage = e.message;
+    else { successMessage = 'Return rejected.'; return Astro.redirect(`/returns/${id}?saved=rejected`); }
+  }
+
+  if (action === 'review') {
+    const { error: e } = await supabase
+      .from('tax_returns').update({ status: 'under_review' }).eq('id', id);
+    if (e) errorMessage = e.message;
+    else return Astro.redirect(`/returns/${id}?saved=review`);
+  }
+}
+
+// Taxpayer: delete draft
+if (Astro.request.method === 'POST' && role === 'taxpayer') {
+  const form   = await Astro.request.formData();
+  const action = form.get('_action')?.toString();
+  if (action === 'delete' && ret.status === 'draft') {
+    await supabase.from('tax_returns').delete().eq('id', id);
+    return Astro.redirect('/returns');
+  }
+}
+
+// Fetch linked payments
+const { data: payments } = await supabase
+  .from('payments')
+  .select('*')
+  .eq('return_id', id)
+  .order('created_at', { ascending: false });
+
+const statusBadge: Record<string, string> = {
+  draft:        'badge-gray',
+  submitted:    'badge-blue',
+  under_review: 'badge-yellow',
+  assessed:     'badge-orange',
+  accepted:     'badge-green',
+  rejected:     'badge-red',
+  amended:      'badge-orange',
+};
+
+const taxTypeLabel: Record<string, string> = {
+  income_tax:      'Income Tax',
+  vat:             'VAT',
+  withholding_tax: 'Withholding Tax',
+  corporate_tax:   'Corporate Tax',
+  pay_as_you_earn: 'PAYE',
+};
+
+const alertMsg: Record<string, { cls: string, msg: string }> = {
+  draft:     { cls: 'alert-info',    msg: '📝 Return saved as draft. Submit when ready.' },
+  submitted: { cls: 'alert-success', msg: '✓ Return submitted successfully. Awaiting officer review.' },
+  accepted:  { cls: 'alert-success', msg: '✓ Return has been accepted by MRA.' },
+  rejected:  { cls: 'alert-danger',  msg: '✗ Return was rejected. See officer notes below.' },
+  review:    { cls: 'alert-warning', msg: '🔍 Return is now under review.' },
+};
+---
+
+<DashLayout title={`Return ${ret.return_reference}`} activeNav="/returns">
+
+  <div class="page-header">
+    <div>
+      <div style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap;">
+        <h1 class="page-title" style="margin:0;">{ret.return_reference}</h1>
+        <span class={`badge ${statusBadge[ret.status] || 'badge-gray'}`} style="font-size:0.8rem;padding:0.3em 0.85em;">
+          {ret.status.replace(/_/g, ' ')}
+        </span>
+      </div>
+      <p class="page-subtitle">{taxTypeLabel[ret.tax_type] || ret.tax_type} · Period: {formatDate(ret.period_from)} – {formatDate(ret.period_to)}</p>
+    </div>
+    <a href="/returns" class="btn btn-ghost">← All Returns</a>
+  </div>
+
+  {savedMsg && alertMsg[savedMsg] && (
+    <div class={`alert ${alertMsg[savedMsg].cls}`} style="margin-bottom:1.25rem;">
+      {alertMsg[savedMsg].msg}
+    </div>
+  )}
+  {errorMessage && <div class="alert alert-danger" style="margin-bottom:1rem;">{errorMessage}</div>}
+
+  <div class="detail-layout">
+
+    <!-- Left: Main details -->
+    <div>
+
+      <!-- Financial breakdown -->
+      <div class="card">
+        <h2 style="font-size:0.85rem;text-transform:uppercase;letter-spacing:0.07em;color:var(--mra-gray-500);margin-bottom:1.1rem;">Financial Summary</h2>
+
+        <div class="finance-grid">
+          <div class="finance-item">
+            <div class="finance-label">Gross Income</div>
+            <div class="finance-value mono">{formatMWK(ret.gross_income || 0)}</div>
+          </div>
+          <div class="finance-item">
+            <div class="finance-label">Deductions</div>
+            <div class="finance-value mono deduction">− {formatMWK(ret.deductions || 0)}</div>
+          </div>
+          <div class="finance-item highlight">
+            <div class="finance-label">Taxable Income</div>
+            <div class="finance-value mono">{formatMWK(ret.taxable_income || 0)}</div>
+          </div>
+          <div class="finance-item">
+            <div class="finance-label">Tax Rate</div>
+            <div class="finance-value mono">{ret.tax_rate || 0}%</div>
+          </div>
+          <div class="finance-item total">
+            <div class="finance-label">Amount Due</div>
+            <div class="finance-value mono total-val">{formatMWK(ret.amount_due || 0)}</div>
+          </div>
+          <div class="finance-item">
+            <div class="finance-label">Amount Paid</div>
+            <div class="finance-value mono">{formatMWK(ret.amount_paid || 0)}</div>
+          </div>
+        </div>
+
+        {ret.balance !== null && ret.balance !== undefined && (
+          <div class={`balance-strip ${ret.balance > 0 ? 'owing' : 'clear'}`}>
+            <span>{ret.balance > 0 ? 'Outstanding Balance' : 'Fully Settled'}</span>
+            <span class="mono">{formatMWK(Math.abs(ret.balance))}</span>
+          </div>
+        )}
+      </div>
+
+      <!-- Return details -->
+      <div class="card" style="margin-top:1.25rem;">
+        <h2 style="font-size:0.85rem;text-transform:uppercase;letter-spacing:0.07em;color:var(--mra-gray-500);margin-bottom:1rem;">Return Details</h2>
+        <div class="detail-row"><span class="detail-label">Reference</span><span class="detail-value mono">{ret.return_reference}</span></div>
+        <div class="detail-row"><span class="detail-label">Tax Type</span><span class="detail-value">{taxTypeLabel[ret.tax_type] || ret.tax_type}</span></div>
+        <div class="detail-row"><span class="detail-label">Period</span><span class="detail-value">{formatDate(ret.period_from)} – {formatDate(ret.period_to)}</span></div>
+        <div class="detail-row"><span class="detail-label">Submission Date</span><span class="detail-value">{ret.submission_date ? formatDate(ret.submission_date) : 'Not submitted'}</span></div>
+        <div class="detail-row"><span class="detail-label">Assessment Date</span><span class="detail-value">{ret.assessment_date ? formatDate(ret.assessment_date) : '—'}</span></div>
+        <div class="detail-row"><span class="detail-label">Filed</span><span class="detail-value">{formatDate(ret.created_at)}</span></div>
+
+        {ret.notes && (
+          <div style="margin-top:1rem;padding-top:1rem;border-top:1px solid var(--mra-gray-200);">
+            <div class="detail-label" style="margin-bottom:0.4rem;">Notes</div>
+            <p style="font-size:0.88rem;color:var(--mra-gray-700);margin:0;line-height:1.5;">{ret.notes}</p>
+          </div>
+        )}
+      </div>
+
+      <!-- Linked payments -->
+      <div class="card" style="margin-top:1.25rem;">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem;">
+          <h2 style="font-size:0.85rem;text-transform:uppercase;letter-spacing:0.07em;color:var(--mra-gray-500);margin:0;">Linked Payments</h2>
+          {ret.status === 'accepted' && (
+            <a href={`/payments/new?return_id=${ret.id}`} class="btn btn-primary btn-sm">+ Record Payment</a>
+          )}
+        </div>
+        {payments && payments.length > 0 ? (
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr><th>Reference</th><th>Amount</th><th>Method</th><th>Date</th><th>Status</th></tr>
+              </thead>
+              <tbody>
+                {payments.map((p: any) => (
+                  <tr>
+                    <td class="mono" style="font-size:0.82rem;">{p.payment_reference}</td>
+                    <td class="mono">{formatMWK(p.amount)}</td>
+                    <td style="text-transform:capitalize;font-size:0.88rem;">{p.payment_method?.replace('_',' ')}</td>
+                    <td class="text-sm text-muted">{formatDate(p.payment_date)}</td>
+                    <td><span class={`badge ${p.status === 'confirmed' ? 'badge-green' : p.status === 'reversed' ? 'badge-red' : 'badge-yellow'}`}>{p.status}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div class="empty-state" style="padding:1.5rem;">
+            <div class="empty-state-icon" style="font-size:1.5rem;">💳</div>
+            <p style="margin:0.5rem 0 0;font-size:0.85rem;">No payments recorded for this return.</p>
+          </div>
+        )}
+      </div>
+    </div>
+
+    <!-- Right sidebar -->
+    <div>
+      <!-- Taxpayer card -->
+      <div class="card taxpayer-card">
+        <h3 style="font-size:0.8rem;text-transform:uppercase;letter-spacing:0.07em;color:var(--mra-gray-500);margin-bottom:0.85rem;">Taxpayer</h3>
+        <div class="taxpayer-tin mono">{ret.taxpayers?.tin}</div>
+        <div class="taxpayer-name">{ret.taxpayers?.name}</div>
+        <div class="detail-row" style="margin-top:0.75rem;"><span class="detail-label">Type</span><span class="detail-value" style="text-transform:capitalize;">{ret.taxpayers?.taxpayer_type}</span></div>
+        <div class="detail-row"><span class="detail-label">Phone</span><span class="detail-value">{ret.taxpayers?.phone || '—'}</span></div>
+        <div class="detail-row"><span class="detail-label">Address</span><span class="detail-value" style="max-width:130px;text-align:right;">{ret.taxpayers?.address || '—'}</span></div>
+      </div>
+
+      <!-- Actions: delete draft (taxpayer) -->
+      {role === 'taxpayer' && ret.status === 'draft' && (
+        <div class="card action-card" style="margin-top:1rem;">
+          <h3 style="font-size:0.8rem;text-transform:uppercase;letter-spacing:0.07em;color:var(--mra-gray-500);margin-bottom:0.85rem;">Actions</h3>
+          <form method="POST">
+            <input type="hidden" name="_action" value="delete" />
+            <p style="font-size:0.83rem;color:var(--mra-gray-500);margin-bottom:0.75rem;">This return is still a draft and has not been submitted.</p>
+            <button
+              type="submit"
+              class="btn btn-danger btn-sm w-full"
+              onclick="return confirm('Delete this draft return? This cannot be undone.')"
+            >
+              Delete Draft
+            </button>
+          </form>
+        </div>
+      )}
+
+      <!-- Officer actions -->
+      {role !== 'taxpayer' && (ret.status === 'submitted' || ret.status === 'under_review') && (
+        <div class="card action-card" style="margin-top:1rem;">
+          <h3 style="font-size:0.8rem;text-transform:uppercase;letter-spacing:0.07em;color:var(--mra-gray-500);margin-bottom:0.85rem;">Officer Actions</h3>
+          <form method="POST">
+            <div class="form-group">
+              <label class="form-label" for="officer_notes">Assessment Notes</label>
+              <textarea id="officer_notes" name="officer_notes" class="form-control" rows="3" placeholder="Add notes for the taxpayer..."></textarea>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem;">
+              {ret.status === 'submitted' && (
+                <button type="submit" name="_action" value="review" class="btn btn-secondary btn-sm">
+                  🔍 Mark Under Review
+                </button>
+              )}
+              <button type="submit" name="_action" value="accept" class="btn btn-primary btn-sm">
+                ✓ Accept Return
+              </button>
+              <button
+                type="submit" name="_action" value="reject"
+                class="btn btn-danger btn-sm"
+                onclick="return confirm('Reject this return?')"
+              >
+                ✗ Reject Return
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+    </div>
+  </div>
+
+</DashLayout>
+
+<style>
+  .detail-layout {
+    display: grid;
+    grid-template-columns: 1fr 260px;
+    gap: 1.5rem;
+    align-items: start;
+  }
+  @media (max-width: 900px) { .detail-layout { grid-template-columns: 1fr; } }
+
+  .finance-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+  }
+  .finance-item {
+    background: var(--mra-gray-50);
+    border-radius: var(--radius);
+    padding: 0.85rem 1rem;
+    border: 1px solid var(--mra-gray-200);
+  }
+  .finance-item.highlight { border-color: var(--mra-green); background: var(--mra-green-light); }
+  .finance-item.total {
+    background: var(--mra-green-dark); border-color: var(--mra-green-dark);
+    grid-column: span 2;
+  }
+  .finance-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--mra-gray-500); margin-bottom: 0.3rem; }
+  .finance-item.total .finance-label { color: rgba(255,255,255,0.6); }
+  .finance-value { font-size: 1rem; font-weight: 700; color: var(--mra-gray-900); }
+  .finance-value.deduction { color: var(--mra-red); }
+  .finance-item.total .finance-value { color: var(--mra-gold); font-size: 1.2rem; }
+  .total-val { font-size: 1.2rem; }
+
+  .balance-strip {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 0.75rem 1rem; border-radius: var(--radius);
+    font-size: 0.88rem; font-weight: 600;
+  }
+  .balance-strip.owing { background: var(--mra-red-light); color: var(--mra-red); }
+  .balance-strip.clear { background: var(--mra-green-light); color: var(--mra-green); }
+
+  .taxpayer-card .taxpayer-tin {
+    font-size: 1.1rem; font-weight: 700; color: var(--mra-green); margin-bottom: 0.2rem;
+  }
+  .taxpayer-card .taxpayer-name {
+    font-size: 0.95rem; font-weight: 600; color: var(--mra-gray-900); margin-bottom: 0.25rem;
+  }
+</style>

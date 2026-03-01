@@ -1,0 +1,563 @@
+---
+import DashLayout from '../../layouts/DashLayout.astro';
+import { createSupabaseServer, formatMWK, formatDate } from '../../lib/supabase';
+
+const supabase = createSupabaseServer(Astro.cookies);
+const { data: { session } } = await supabase.auth.getSession();
+if (!session) return Astro.redirect('/login');
+
+const { data: userProfile } = await supabase
+  .from('users').select('*').eq('id', session.user.id).single();
+
+// Only taxpayers can file returns
+const role = userProfile?.role || 'taxpayer';
+
+// Get taxpayer profile
+const { data: taxpayer } = await supabase
+  .from('taxpayers').select('*').eq('user_id', session.user.id).single();
+
+if (!taxpayer) return Astro.redirect('/profile/setup');
+
+let errorMessage = '';
+let fieldErrors: Record<string, string> = {};
+let savedDraft = false;
+
+if (Astro.request.method === 'POST') {
+  const form = await Astro.request.formData();
+
+  const action       = form.get('_action')?.toString() || 'submit';
+  const taxType      = form.get('tax_type')?.toString() || '';
+  const periodFrom   = form.get('period_from')?.toString() || '';
+  const periodTo     = form.get('period_to')?.toString() || '';
+  const grossIncome  = parseFloat(form.get('gross_income')?.toString() || '0') || 0;
+  const deductions   = parseFloat(form.get('deductions')?.toString() || '0') || 0;
+  const taxRate      = parseFloat(form.get('tax_rate')?.toString() || '0') || 0;
+  const notes        = form.get('notes')?.toString().trim() || '';
+
+  // Validation
+  if (!taxType)    fieldErrors.tax_type    = 'Please select a tax type.';
+  if (!periodFrom) fieldErrors.period_from = 'Start of tax period is required.';
+  if (!periodTo)   fieldErrors.period_to   = 'End of tax period is required.';
+  if (periodFrom && periodTo && periodFrom > periodTo)
+    fieldErrors.period_to = 'Period end must be after period start.';
+  if (grossIncome < 0) fieldErrors.gross_income = 'Gross income cannot be negative.';
+  if (deductions < 0)  fieldErrors.deductions   = 'Deductions cannot be negative.';
+  if (deductions > grossIncome)
+    fieldErrors.deductions = 'Deductions cannot exceed gross income.';
+  if (taxRate < 0 || taxRate > 100) fieldErrors.tax_rate = 'Tax rate must be between 0 and 100.';
+
+  if (Object.keys(fieldErrors).length === 0) {
+    const taxableIncome = Math.max(grossIncome - deductions, 0);
+    const amountDue     = parseFloat(((taxableIncome * taxRate) / 100).toFixed(2));
+
+    // Generate reference number
+    const year    = new Date().getFullYear();
+    const randNum = Math.floor(Math.random() * 9000000) + 1000000;
+    const returnReference = `TRN-${year}-${randNum}`;
+
+    const status = action === 'draft' ? 'draft' : 'submitted';
+    const submissionDate = action === 'submit' ? new Date().toISOString() : null;
+
+    const { data: newReturn, error } = await supabase
+      .from('tax_returns')
+      .insert({
+        taxpayer_id:      taxpayer.id,
+        return_reference: returnReference,
+        tax_type:         taxType,
+        period_from:      periodFrom,
+        period_to:        periodTo,
+        gross_income:     grossIncome,
+        deductions:       deductions,
+        taxable_income:   taxableIncome,
+        tax_rate:         taxRate,
+        amount_due:       amountDue,
+        status,
+        submission_date:  submissionDate,
+        notes:            notes || null,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      errorMessage = error.message;
+    } else {
+      // Audit log
+      await supabase.from('audit_logs').insert({
+        user_id:    session.user.id,
+        action:     status === 'draft' ? 'DRAFT' : 'SUBMIT',
+        table_name: 'tax_returns',
+        record_id:  newReturn.id,
+        new_values: { return_reference: returnReference, tax_type: taxType, amount_due: amountDue, status },
+      });
+
+      if (action === 'draft') {
+        return Astro.redirect(`/returns/${newReturn.id}?saved=draft`);
+      } else {
+        return Astro.redirect(`/returns/${newReturn.id}?saved=submitted`);
+      }
+    }
+  }
+}
+
+// Tax rate defaults per type
+const defaultRates: Record<string, number> = {
+  income_tax:       30,
+  vat:              16.5,
+  withholding_tax:  20,
+  corporate_tax:    30,
+  pay_as_you_earn:  30,
+};
+---
+
+<DashLayout title="File New Return" activeNav="/returns">
+
+  <div class="page-header">
+    <div>
+      <h1 class="page-title">File New Tax Return</h1>
+      <p class="page-subtitle">TIN: <span class="mono" style="font-weight:600;">{taxpayer.tin}</span> · {taxpayer.name}</p>
+    </div>
+    <a href="/returns" class="btn btn-ghost">← Back to Returns</a>
+  </div>
+
+  <div class="return-layout">
+
+    <!-- Main form -->
+    <div class="return-form-col">
+
+      {errorMessage && <div class="alert alert-danger" style="margin-bottom:1.25rem;">{errorMessage}</div>}
+
+      <form method="POST" id="return-form">
+
+        <!-- Step 1: Tax type -->
+        <div class="form-section card">
+          <div class="section-header">
+            <div class="section-num">1</div>
+            <div>
+              <h2 class="section-title">Tax Type &amp; Period</h2>
+              <p class="section-desc">Select what type of tax this return is for and the period it covers.</p>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label required">Tax Type</label>
+            <div class="type-grid">
+              {[
+                { value: 'income_tax',       label: 'Income Tax',      icon: '💼', desc: 'Personal income' },
+                { value: 'vat',              label: 'VAT',             icon: '🛒', desc: '16.5% standard rate' },
+                { value: 'withholding_tax',  label: 'Withholding Tax', icon: '✂️', desc: 'Deducted at source' },
+                { value: 'corporate_tax',    label: 'Corporate Tax',   icon: '🏢', desc: 'Company profits' },
+                { value: 'pay_as_you_earn',  label: 'PAYE',            icon: '👥', desc: 'Employee payroll' },
+              ].map(t => (
+                <label class="type-option">
+                  <input
+                    type="radio"
+                    name="tax_type"
+                    value={t.value}
+                    data-rate={defaultRates[t.value]}
+                  />
+                  <div class="type-option-inner">
+                    <span class="type-option-icon">{t.icon}</span>
+                    <span class="type-option-label">{t.label}</span>
+                    <span class="type-option-desc">{t.desc}</span>
+                  </div>
+                </label>
+              ))}
+            </div>
+            {fieldErrors.tax_type && <p class="form-error">{fieldErrors.tax_type}</p>}
+          </div>
+
+          <div class="two-col">
+            <div class="form-group">
+              <label class="form-label required" for="period_from">Period Start</label>
+              <input
+                id="period_from"
+                type="date"
+                name="period_from"
+                class={`form-control ${fieldErrors.period_from ? 'is-invalid' : ''}`}
+                required
+              />
+              {fieldErrors.period_from && <p class="form-error">{fieldErrors.period_from}</p>}
+            </div>
+            <div class="form-group">
+              <label class="form-label required" for="period_to">Period End</label>
+              <input
+                id="period_to"
+                type="date"
+                name="period_to"
+                class={`form-control ${fieldErrors.period_to ? 'is-invalid' : ''}`}
+                required
+              />
+              {fieldErrors.period_to && <p class="form-error">{fieldErrors.period_to}</p>}
+            </div>
+          </div>
+        </div>
+
+        <!-- Step 2: Income & deductions -->
+        <div class="form-section card" style="margin-top:1.25rem;">
+          <div class="section-header">
+            <div class="section-num">2</div>
+            <div>
+              <h2 class="section-title">Income &amp; Deductions</h2>
+              <p class="section-desc">Enter your gross income and any allowable deductions for the period.</p>
+            </div>
+          </div>
+
+          <div class="two-col">
+            <div class="form-group">
+              <label class="form-label required" for="gross_income">Gross Income (MWK)</label>
+              <div class="input-prefix-wrap">
+                <span class="input-prefix">MWK</span>
+                <input
+                  id="gross_income"
+                  type="number"
+                  name="gross_income"
+                  class={`form-control has-prefix ${fieldErrors.gross_income ? 'is-invalid' : ''}`}
+                  placeholder="0.00"
+                  min="0"
+                  step="0.01"
+                  required
+                  oninput="calcTax()"
+                />
+              </div>
+              {fieldErrors.gross_income && <p class="form-error">{fieldErrors.gross_income}</p>}
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="deductions">Allowable Deductions (MWK)</label>
+              <div class="input-prefix-wrap">
+                <span class="input-prefix">MWK</span>
+                <input
+                  id="deductions"
+                  type="number"
+                  name="deductions"
+                  class={`form-control has-prefix ${fieldErrors.deductions ? 'is-invalid' : ''}`}
+                  placeholder="0.00"
+                  min="0"
+                  step="0.01"
+                  value="0"
+                  oninput="calcTax()"
+                />
+              </div>
+              {fieldErrors.deductions && <p class="form-error">{fieldErrors.deductions}</p>}
+              <p class="form-hint">Pension, donations, allowances etc.</p>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label required" for="tax_rate">Applicable Tax Rate (%)</label>
+            <div class="input-suffix-wrap">
+              <input
+                id="tax_rate"
+                type="number"
+                name="tax_rate"
+                class={`form-control has-suffix ${fieldErrors.tax_rate ? 'is-invalid' : ''}`}
+                placeholder="0"
+                min="0"
+                max="100"
+                step="0.01"
+                value="0"
+                oninput="calcTax()"
+                required
+              />
+              <span class="input-suffix">%</span>
+            </div>
+            {fieldErrors.tax_rate && <p class="form-error">{fieldErrors.tax_rate}</p>}
+            <p class="form-hint">Rate is pre-filled based on tax type. Adjust if needed.</p>
+          </div>
+        </div>
+
+        <!-- Step 3: Notes -->
+        <div class="form-section card" style="margin-top:1.25rem;">
+          <div class="section-header">
+            <div class="section-num">3</div>
+            <div>
+              <h2 class="section-title">Notes &amp; Declaration</h2>
+              <p class="section-desc">Add any relevant notes and confirm the declaration before submitting.</p>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="notes">Notes (optional)</label>
+            <textarea
+              id="notes"
+              name="notes"
+              class="form-control"
+              placeholder="Any additional information relevant to this return..."
+              rows="3"
+            ></textarea>
+          </div>
+
+          <div class="declaration-box">
+            <label class="declaration-check">
+              <input type="checkbox" id="declaration" required />
+              <span>
+                I declare that the information provided in this tax return is true, complete,
+                and accurate to the best of my knowledge. I understand that providing false
+                information is an offence under the Taxation Act of Malawi.
+              </span>
+            </label>
+          </div>
+
+          <div class="form-actions">
+            <button type="submit" name="_action" value="submit" class="btn btn-primary btn-lg" id="submit-btn">
+              Submit Return →
+            </button>
+            <button type="submit" name="_action" value="draft" class="btn btn-ghost btn-lg" id="draft-btn">
+              Save as Draft
+            </button>
+            <a href="/returns" class="btn btn-ghost btn-lg">Cancel</a>
+          </div>
+        </div>
+
+      </form>
+    </div>
+
+    <!-- Right: Live calculation panel -->
+    <div class="calc-panel">
+      <div class="card calc-card" style="position:sticky;top:1.5rem;">
+        <h3 class="calc-title">Live Calculation</h3>
+
+        <div class="calc-tin-badge">
+          <span class="mono">{taxpayer.tin}</span>
+          <span class={`badge ${taxpayer.verification_status === 'verified' ? 'badge-green' : 'badge-yellow'}`}>
+            {taxpayer.verification_status}
+          </span>
+        </div>
+
+        <div class="calc-rows">
+          <div class="calc-row">
+            <span class="calc-label">Gross Income</span>
+            <span class="calc-value mono" id="disp-gross">MWK 0.00</span>
+          </div>
+          <div class="calc-row">
+            <span class="calc-label">Less: Deductions</span>
+            <span class="calc-value mono deduction" id="disp-deductions">− MWK 0.00</span>
+          </div>
+          <div class="calc-row subtotal">
+            <span class="calc-label">Taxable Income</span>
+            <span class="calc-value mono" id="disp-taxable">MWK 0.00</span>
+          </div>
+          <div class="calc-row">
+            <span class="calc-label">Tax Rate</span>
+            <span class="calc-value mono" id="disp-rate">0%</span>
+          </div>
+        </div>
+
+        <div class="calc-total">
+          <span class="calc-total-label">Amount Due</span>
+          <span class="calc-total-value mono" id="disp-due">MWK 0.00</span>
+        </div>
+
+        <div class="calc-notice">
+          <p>⚠️ This is an estimate. Final assessment is determined by MRA officers upon review.</p>
+        </div>
+
+        <!-- Period summary -->
+        <div class="calc-period" id="period-display" style="display:none;">
+          <div class="calc-period-label">Tax Period</div>
+          <div class="calc-period-value" id="period-value">—</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+</DashLayout>
+
+<style>
+  .return-layout {
+    display: grid;
+    grid-template-columns: 1fr 280px;
+    gap: 1.5rem;
+    align-items: start;
+  }
+  @media (max-width: 900px) {
+    .return-layout { grid-template-columns: 1fr; }
+    .calc-panel { order: -1; }
+  }
+
+  /* Form sections */
+  .form-section { padding: 1.5rem; }
+  .section-header {
+    display: flex;
+    align-items: flex-start;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+    padding-bottom: 1rem;
+    border-bottom: 1px solid var(--mra-gray-200);
+  }
+  .section-num {
+    width: 32px; height: 32px;
+    border-radius: 50%;
+    background: var(--mra-green);
+    color: #fff;
+    font-weight: 700;
+    font-size: 0.9rem;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .section-title { font-size: 1rem; margin: 0 0 0.2rem; }
+  .section-desc  { font-size: 0.83rem; color: var(--mra-gray-500); margin: 0; }
+
+  /* Tax type grid */
+  .type-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 0.6rem;
+    margin-top: 0.5rem;
+  }
+  .type-option input[type="radio"] { display: none; }
+  .type-option-inner {
+    display: flex; flex-direction: column; align-items: center;
+    gap: 0.25rem; padding: 0.8rem 0.5rem;
+    border: 2px solid var(--mra-gray-200); border-radius: var(--radius);
+    cursor: pointer; transition: all 0.15s; text-align: center;
+  }
+  .type-option:hover .type-option-inner { border-color: var(--mra-green); background: var(--mra-green-light); }
+  .type-option input:checked + .type-option-inner {
+    border-color: var(--mra-green);
+    background: var(--mra-green-light);
+    box-shadow: 0 0 0 3px rgba(0,90,48,0.1);
+  }
+  .type-option-icon  { font-size: 1.3rem; }
+  .type-option-label { font-size: 0.82rem; font-weight: 700; color: var(--mra-gray-900); }
+  .type-option-desc  { font-size: 0.7rem; color: var(--mra-gray-500); }
+
+  /* Input prefix/suffix */
+  .input-prefix-wrap, .input-suffix-wrap {
+    position: relative; display: flex; align-items: center;
+  }
+  .input-prefix {
+    position: absolute; left: 0.75rem;
+    font-size: 0.8rem; font-weight: 700; color: var(--mra-gray-500);
+    font-family: var(--font-mono); pointer-events: none;
+    z-index: 1;
+  }
+  .input-suffix {
+    position: absolute; right: 0.75rem;
+    font-size: 0.85rem; font-weight: 700; color: var(--mra-gray-500);
+    pointer-events: none;
+  }
+  .form-control.has-prefix { padding-left: 3.2rem; }
+  .form-control.has-suffix { padding-right: 2.5rem; }
+  .is-invalid { border-color: var(--mra-red) !important; }
+
+  /* Declaration */
+  .declaration-box {
+    background: var(--mra-gray-50);
+    border: 1.5px solid var(--mra-gray-200);
+    border-radius: var(--radius);
+    padding: 1rem 1.1rem;
+    margin-bottom: 1.25rem;
+  }
+  .declaration-check {
+    display: flex; align-items: flex-start; gap: 0.75rem; cursor: pointer;
+    font-size: 0.85rem; color: var(--mra-gray-700); line-height: 1.5;
+  }
+  .declaration-check input { margin-top: 3px; flex-shrink: 0; accent-color: var(--mra-green); width: 16px; height: 16px; }
+
+  .form-actions {
+    display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center;
+  }
+
+  /* Calc panel */
+  .calc-card { padding: 1.25rem; }
+  .calc-title {
+    font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--mra-gray-500); font-family: var(--font-sans);
+    font-weight: 700; margin-bottom: 0.75rem;
+  }
+  .calc-tin-badge {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 1rem; padding-bottom: 0.75rem;
+    border-bottom: 1px solid var(--mra-gray-200);
+    font-size: 0.82rem;
+  }
+  .calc-rows { display: flex; flex-direction: column; gap: 0.1rem; margin-bottom: 1rem; }
+  .calc-row {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 0.45rem 0; border-bottom: 1px dashed var(--mra-gray-100);
+  }
+  .calc-row.subtotal {
+    border-bottom: 2px solid var(--mra-gray-300);
+    padding-bottom: 0.6rem; margin-bottom: 0.3rem;
+  }
+  .calc-label { font-size: 0.82rem; color: var(--mra-gray-500); }
+  .calc-value { font-size: 0.83rem; color: var(--mra-gray-900); }
+  .calc-value.deduction { color: var(--mra-red); }
+  .calc-total {
+    display: flex; justify-content: space-between; align-items: center;
+    background: var(--mra-green-dark);
+    border-radius: var(--radius);
+    padding: 0.85rem 1rem;
+    margin-bottom: 0.75rem;
+  }
+  .calc-total-label { font-size: 0.82rem; color: rgba(255,255,255,0.7); font-weight: 600; }
+  .calc-total-value { font-size: 1rem; font-weight: 700; color: var(--mra-gold); }
+  .calc-notice {
+    background: var(--mra-gold-light);
+    border-left: 3px solid var(--mra-gold);
+    border-radius: 0 var(--radius) var(--radius) 0;
+    padding: 0.6rem 0.75rem;
+    font-size: 0.75rem; color: #7a5800;
+  }
+  .calc-notice p { margin: 0; line-height: 1.4; }
+  .calc-period { margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--mra-gray-200); }
+  .calc-period-label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--mra-gray-500); margin-bottom: 0.2rem; }
+  .calc-period-value { font-size: 0.83rem; font-weight: 600; color: var(--mra-gray-700); font-family: var(--font-mono); }
+</style>
+
+<script define:vars={{ defaultRates }}>
+  const fmt = (n) => new Intl.NumberFormat('en-MW', { style: 'currency', currency: 'MWK', minimumFractionDigits: 2 }).format(n);
+
+  function calcTax() {
+    const gross      = parseFloat(document.getElementById('gross_income').value) || 0;
+    const deductions = parseFloat(document.getElementById('deductions').value)   || 0;
+    const rate       = parseFloat(document.getElementById('tax_rate').value)     || 0;
+    const taxable    = Math.max(gross - deductions, 0);
+    const due        = parseFloat(((taxable * rate) / 100).toFixed(2));
+
+    document.getElementById('disp-gross').textContent      = fmt(gross);
+    document.getElementById('disp-deductions').textContent = '− ' + fmt(deductions);
+    document.getElementById('disp-taxable').textContent    = fmt(taxable);
+    document.getElementById('disp-rate').textContent       = rate.toFixed(2) + '%';
+    document.getElementById('disp-due').textContent        = fmt(due);
+  }
+
+  // Auto-fill rate when tax type selected
+  document.querySelectorAll('input[name="tax_type"]').forEach(radio => {
+    radio.addEventListener('change', () => {
+      const rate = radio.dataset.rate || 0;
+      document.getElementById('tax_rate').value = rate;
+      calcTax();
+    });
+  });
+
+  // Update period display
+  function updatePeriod() {
+    const from = document.getElementById('period_from').value;
+    const to   = document.getElementById('period_to').value;
+    const el   = document.getElementById('period-display');
+    const val  = document.getElementById('period-value');
+    if (from && to) {
+      const f = new Date(from).toLocaleDateString('en-GB', { day:'2-digit', month:'short', year:'numeric' });
+      const t = new Date(to).toLocaleDateString('en-GB',   { day:'2-digit', month:'short', year:'numeric' });
+      val.textContent = f + ' — ' + t;
+      el.style.display = 'block';
+    }
+  }
+
+  document.getElementById('period_from').addEventListener('change', updatePeriod);
+  document.getElementById('period_to').addEventListener('change',   updatePeriod);
+
+  // Disable submit button until declaration checked
+  const declaration  = document.getElementById('declaration');
+  const submitBtn    = document.getElementById('submit-btn');
+  declaration.addEventListener('change', () => {
+    submitBtn.disabled = !declaration.checked;
+    submitBtn.style.opacity = declaration.checked ? '1' : '0.5';
+  });
+  submitBtn.disabled = true;
+  submitBtn.style.opacity = '0.5';
+
+  calcTax();
+</script>

@@ -10,41 +10,53 @@ let errorMessage = '';
 let successMessage = '';
 
 if (Astro.request.method === 'POST') {
-  const contentType = Astro.request.headers.get('content-type') || '';
+  const form = await Astro.request.formData();
 
-  if (contentType.includes('application/x-www-form-urlencoded') ||
-      contentType.includes('multipart/form-data')) {
+  const email           = form.get('email')?.toString().trim() || '';
+  const password        = form.get('password')?.toString() || '';
+  const confirmPassword = form.get('confirm_password')?.toString() || '';
+  const fullName        = form.get('full_name')?.toString().trim() || '';
 
-    const form = await Astro.request.formData();
-
-    const email = form.get('email')?.toString() || '';
-    const password = form.get('password')?.toString() || '';
-    const confirmPassword = form.get('confirm_password')?.toString() || '';
-    const fullName = form.get('full_name')?.toString() || '';
-
-    // validation logic...
+  if (!email || !password || !fullName) {
+    errorMessage = 'All fields are required.';
+  } else if (password !== confirmPassword) {
+    errorMessage = 'Passwords do not match.';
+  } else if (password.length < 8) {
+    errorMessage = 'Password must be at least 8 characters.';
   } else {
-    errorMessage = 'Invalid form submission.';
+    const { error } = await supabase.auth.signUp({
+      email,
+      password,
+      options: {
+        data: { full_name: fullName, role: 'taxpayer' }
+      }
+    });
+    if (error) {
+      errorMessage = error.message;
+    } else {
+      successMessage = 'Account created! Check your email to verify, then sign in to complete your taxpayer profile.';
+    }
   }
 }
 ---
 
-<Layout title="Register">
+<Layout title="Register — MRA">
   <div class="auth-page">
+
     <div class="auth-banner">
       <div class="banner-content">
         <div class="banner-emblem">
-          <img src="https://www.mra.mw/images/MRA%20AT%2025%20LOGO%20FINAL-01.png" alt="MRA Emblem" style="width: 100%; height: auto;" />
+          <img src="https://www.mra.mw/images/MRA%20AT%2025%20LOGO%20FINAL-01.png" alt="MRA Emblem" style="width:120px; height:auto;" />
         </div>
         <h1>Malawi Revenue Authority</h1>
         <p>Taxpayer Registration Portal</p>
         <div class="banner-divider"></div>
-        <!-- <ul class="feature-list">
+        <ul class="feature-list">
           <li>✓ Submit tax returns online</li>
           <li>✓ Track payment history</li>
           <li>✓ Receive compliance notices</li>
           <li>✓ View audit status</li>
-        </ul> -->
+        </ul>
       </div>
     </div>
 
@@ -57,13 +69,20 @@ if (Astro.request.method === 'POST') {
 
         {successMessage && (
           <div class="alert alert-success">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="20 6 9 17 4 12"/>
+            </svg>
             {successMessage}
           </div>
         )}
+
         {errorMessage && (
-          <div class="alert alert-error">
-            {/* <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg> */}
+          <div class="alert alert-danger">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"/>
+              <line x1="12" y1="8" x2="12" y2="12"/>
+              <line x1="12" y1="16" x2="12.01" y2="16"/>
+            </svg>
             {errorMessage}
           </div>
         )}
@@ -72,23 +91,33 @@ if (Astro.request.method === 'POST') {
           <form method="POST" class="auth-form">
             <div class="form-group">
               <label class="form-label">Full Name</label>
-              <input class="form-input" type="text" name="full_name" placeholder="Name" required />
+              <input class="form-input" type="text" name="full_name" placeholder="e.g. Jabulani Kapherachoka" required autocomplete="name" />
             </div>
             <div class="form-group">
               <label class="form-label">Email Address</label>
-              <input class="form-input" type="email" name="email" placeholder="Email" required />
+              <input class="form-input" type="email" name="email" placeholder="you@example.com" required autocomplete="email" />
             </div>
             <div class="form-group">
               <label class="form-label">Password</label>
-              <input class="form-input" type="password" name="password" placeholder="Password- 8+ chars" minlength="8" required />
+              <input class="form-input" type="password" name="password" placeholder="Minimum 8 characters" minlength="8" required autocomplete="new-password" />
             </div>
             <div class="form-group">
               <label class="form-label">Confirm Password</label>
-              <input class="form-input" type="password" name="confirm_password" placeholder="Verify password" required />
+              <input class="form-input" type="password" name="confirm_password" placeholder="Repeat your password" required autocomplete="new-password" />
             </div>
-            <p class="notice">After registration, complete your taxpayer profile to receive your TIN.</p>
+
+            <p class="notice">
+              After registration, complete your taxpayer profile to receive your TIN.
+            </p>
+
             <button type="submit" class="btn btn-primary btn-full">Create Account →</button>
           </form>
+        )}
+
+        {successMessage && (
+          <a href="/login" class="btn btn-primary btn-full" style="margin-top:1rem;justify-content:center;">
+            Go to Sign In →
+          </a>
         )}
 
         <div class="auth-footer">
@@ -100,30 +129,91 @@ if (Astro.request.method === 'POST') {
 </Layout>
 
 <style>
-.auth-page { display: flex; min-height: 100vh; }
-.auth-banner { width: 45%; background: var(--mra-green-dark); display: flex; align-items: center; justify-content: center; position: relative; overflow: hidden; }
-.auth-banner::before { content: ''; position: absolute; inset: 0; background: repeating-linear-gradient(45deg, transparent, transparent 40px, rgba(255,255,255,0.02) 40px, rgba(255,255,255,0.02) 80px); }
-.banner-content { text-align: center; color: white; position: relative; z-index: 1; padding: 40px; }
-.banner-flag { display: flex; gap: 6px; justify-content: center; margin-bottom: 24px; }
-.flag-bar { height: 32px; width: 10px; border-radius: 2px; }
-.bar-black { background: #222; }
-.bar-red { background: #CE1126; }
-.bar-white { background: rgba(255,255,255,0.9); }
-.bar-green { background: #009A44; }
-.banner-emblem { font-size: 60px; margin-bottom: 16px; display: block; }
-.banner-content h1 { font-family: var(--font-serif); font-size: 28px; margin-bottom: 8px; color: #FFD700; }
-.banner-content p { font-size: 15px; color: rgba(255,255,255,0.7); margin-bottom: 24px; }
-.banner-divider { width: 40px; height: 2px; background: rgba(255,215,0,0.5); margin: 0 auto 20px; }
-.feature-list { list-style: none; text-align: left; display: inline-block; }
-.feature-list li { font-size: 14px; color: rgba(255,255,255,0.8); padding: 4px 0; }
-.auth-panel { flex: 1; display: flex; align-items: center; justify-content: center; padding: 40px; background: var(--mra-gray-50); }
-.auth-box { width: 100%; max-width: 420px; }
-.auth-header { margin-bottom: 28px; }
-.auth-header h2 { font-family: var(--font-serif); font-size: 26px; color: var(--mra-black); margin-bottom: 6px; }
-.auth-header p { color: var(--mra-gray-400); font-size: 15px; }
-.notice { font-size: 12px; color: var(--mra-gray-400); margin-bottom: 12px; padding: 10px 12px; background: var(--mra-gray-50); border-left: 3px solid var(--mra-gold); }
-.auth-form .btn-full { width: 100%; justify-content: center; padding: 13px; font-size: 15px; margin-top: 4px; }
-.auth-footer { margin-top: 24px; text-align: center; font-size: 14px; color: var(--mra-gray-400); }
-.auth-footer a { color: var(--mra-green); font-weight: 600; }
-@media (max-width: 768px) { .auth-banner { display: none; } .auth-panel { padding: 24px; } }
+  /* Shared with login — reuse same layout pattern */
+  .auth-page { display: flex; min-height: 100vh; }
+
+  .auth-banner {
+    width: 45%;
+    background: var(--mra-green-dark);
+    display: flex; align-items: center; justify-content: center;
+    position: relative; overflow: hidden;
+  }
+  .auth-banner::before {
+    content: ''; position: absolute; inset: 0;
+    background: repeating-linear-gradient(45deg, transparent, transparent 40px, rgba(255,255,255,0.02) 40px, rgba(255,255,255,0.02) 80px);
+  }
+
+  .banner-content {
+    text-align: center; color: white;
+    position: relative; z-index: 1; padding: 40px;
+  }
+  .banner-emblem { margin-bottom: 20px; display: block; }
+  .banner-content h1 {
+    font-family: var(--font-serif); font-size: 28px;
+    margin-bottom: 8px; color: #FFD700;
+  }
+  .banner-content p { font-size: 15px; color: rgba(255,255,255,0.7); margin-bottom: 24px; }
+  .banner-divider { width: 40px; height: 2px; background: rgba(255,215,0,0.5); margin: 0 auto 20px; }
+
+  .feature-list { list-style: none; padding: 0; text-align: left; display: inline-block; }
+  .feature-list li { font-size: 14px; color: rgba(255,255,255,0.8); padding: 4px 0; }
+
+  .auth-panel {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    padding: 40px; background: #fff;
+  }
+  .auth-box { width: 100%; max-width: 420px; }
+
+  .auth-header { margin-bottom: 28px; }
+  .auth-header h2 { font-family: var(--font-serif); font-size: 26px; color: var(--mra-green-dark); margin-bottom: 6px; }
+  .auth-header p { color: var(--mra-gray-500); font-size: 15px; }
+
+  .auth-form .form-group { margin-bottom: 1rem; }
+
+  .form-input {
+    display: block; width: 100%; padding: 0.6rem 0.85rem;
+    border: 1.5px solid var(--mra-gray-300); border-radius: var(--radius);
+    font-family: var(--font-sans); font-size: 0.9rem; color: var(--mra-gray-900);
+    background: #fff; transition: border-color 0.15s, box-shadow 0.15s;
+    box-sizing: border-box;
+  }
+  .form-input:focus {
+    outline: none; border-color: var(--mra-green);
+    box-shadow: 0 0 0 3px rgba(0,90,48,0.12);
+  }
+
+  .form-label {
+    display: block; margin-bottom: 0.4rem;
+    font-weight: 600; font-size: 0.88rem; color: var(--mra-gray-700);
+  }
+
+  .alert {
+    display: flex; align-items: flex-start; gap: 0.5rem;
+    padding: 0.85rem 1rem; border-radius: var(--radius);
+    font-size: 0.88rem; margin-bottom: 1.1rem; border-left: 4px solid;
+  }
+  .alert svg { flex-shrink: 0; margin-top: 1px; }
+  .alert-success { background: var(--mra-green-light); border-color: var(--mra-green); color: var(--mra-green-dark); }
+  .alert-danger  { background: var(--mra-red-light);   border-color: var(--mra-red);   color: #7a1a1a; }
+
+  .notice {
+    font-size: 12px; color: var(--mra-gray-500);
+    margin-bottom: 12px; padding: 10px 12px;
+    background: var(--mra-gray-100);
+    border-left: 3px solid var(--mra-gold);
+    border-radius: 0 var(--radius) var(--radius) 0;
+  }
+
+  .btn-full { width: 100%; justify-content: center; padding: 13px; font-size: 15px; }
+
+  .auth-footer {
+    margin-top: 24px; text-align: center;
+    font-size: 14px; color: var(--mra-gray-500);
+  }
+  .auth-footer a { color: var(--mra-green); font-weight: 600; }
+
+  @media (max-width: 768px) {
+    .auth-banner { display: none; }
+    .auth-panel  { padding: 24px; }
+  }
 </style>

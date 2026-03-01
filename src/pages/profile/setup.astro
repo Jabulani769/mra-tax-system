@@ -1,0 +1,335 @@
+---
+import DashLayout from '../../layouts/DashLayout.astro';
+import { createSupabaseServer } from '../../lib/supabase';
+
+const supabase = createSupabaseServer(Astro.cookies);
+const { data: { session } } = await supabase.auth.getSession();
+if (!session) return Astro.redirect('/login');
+
+// Check if taxpayer profile already exists
+const { data: existing } = await supabase
+  .from('taxpayers')
+  .select('tin')
+  .eq('user_id', session.user.id)
+  .single();
+
+if (existing) return Astro.redirect('/profile');
+
+const { data: userProfile } = await supabase
+  .from('users')
+  .select('full_name, email')
+  .eq('id', session.user.id)
+  .single();
+
+let errorMessage = '';
+let fieldErrors: Record<string, string> = {};
+
+if (Astro.request.method === 'POST') {
+  const form = await Astro.request.formData();
+
+  const taxpayerType = form.get('taxpayer_type')?.toString() || '';
+  const phone        = form.get('phone')?.toString().trim() || '';
+  const address      = form.get('address')?.toString().trim() || '';
+  const businessName = form.get('business_name')?.toString().trim() || '';
+
+  // Validation
+  if (!taxpayerType) fieldErrors.taxpayer_type = 'Please select a taxpayer type.';
+  if (!phone)        fieldErrors.phone    = 'Phone number is required.';
+  if (!address)      fieldErrors.address  = 'Physical address is required.';
+  if (taxpayerType !== 'individual' && !businessName)
+    fieldErrors.business_name = 'Business / organisation name is required.';
+
+  if (Object.keys(fieldErrors).length === 0) {
+    // Generate TIN using the DB function
+    const prefix = taxpayerType === 'individual' ? 'IND' : taxpayerType === 'company' ? 'CMP' : 'PRT';
+    const seqNum  = Math.floor(Math.random() * 9000000) + 1000000;
+    const tin     = `${prefix}-${seqNum}`;
+
+    const { error } = await supabase.from('taxpayers').insert({
+      user_id:             session.user.id,
+      tin,
+      taxpayer_type:       taxpayerType,
+      name:                userProfile?.full_name || session.user.email || '',
+      email:               userProfile?.email || session.user.email || '',
+      phone,
+      address,
+      business_name:       businessName || null,
+      verification_status: 'pending',
+    });
+
+    if (error) {
+      errorMessage = error.message;
+    } else {
+      // Log the action
+      await supabase.from('audit_logs').insert({
+        user_id:    session.user.id,
+        action:     'CREATE',
+        table_name: 'taxpayers',
+        new_values: { tin, taxpayer_type: taxpayerType },
+      });
+      return Astro.redirect('/profile?new=1');
+    }
+  }
+}
+---
+
+<DashLayout title="Complete Your Profile" activeNav="/profile">
+  <div style="max-width: 680px;">
+
+    <!-- Progress indicator -->
+    <div class="setup-steps">
+      <div class="step done">
+        <div class="step-dot">✓</div>
+        <span>Account Created</span>
+      </div>
+      <div class="step-line done"></div>
+      <div class="step active">
+        <div class="step-dot">2</div>
+        <span>Taxpayer Details</span>
+      </div>
+      <div class="step-line"></div>
+      <div class="step">
+        <div class="step-dot">3</div>
+        <span>TIN Issued</span>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top: 1.5rem;">
+      <div style="margin-bottom: 1.5rem;">
+        <h2 style="margin:0 0 0.25rem;">Taxpayer Registration</h2>
+        <p class="text-muted text-sm">Fill in your details below. Your Tax Identification Number (TIN) will be generated automatically upon submission.</p>
+      </div>
+
+      {errorMessage && (
+        <div class="alert alert-danger">{errorMessage}</div>
+      )}
+
+      <form method="POST">
+
+        <!-- Pre-filled user info (read-only) -->
+        <div class="prefilled-row">
+          <div>
+            <div class="form-label">Full Name</div>
+            <div class="prefilled-value">{userProfile?.full_name || '—'}</div>
+          </div>
+          <div>
+            <div class="form-label">Email Address</div>
+            <div class="prefilled-value">{userProfile?.email || session.user.email}</div>
+          </div>
+        </div>
+        <p class="form-hint" style="margin-bottom:1.25rem;">Name and email are taken from your account. <a href="/profile">Update account details</a> if needed.</p>
+
+        <hr class="divider" />
+
+        <!-- Taxpayer type -->
+        <div class="form-group">
+          <label class="form-label required">Taxpayer Type</label>
+          <div class="type-cards">
+            <label class="type-card">
+              <input type="radio" name="taxpayer_type" value="individual" required />
+              <div class="type-card-inner">
+                <div class="type-icon">👤</div>
+                <div class="type-name">Individual</div>
+                <div class="type-desc">Personal income tax, PAYE</div>
+              </div>
+            </label>
+            <label class="type-card">
+              <input type="radio" name="taxpayer_type" value="company" />
+              <div class="type-card-inner">
+                <div class="type-icon">🏢</div>
+                <div class="type-name">Company</div>
+                <div class="type-desc">Corporate tax, VAT</div>
+              </div>
+            </label>
+            <label class="type-card">
+              <input type="radio" name="taxpayer_type" value="partnership" />
+              <div class="type-card-inner">
+                <div class="type-icon">🤝</div>
+                <div class="type-name">Partnership</div>
+                <div class="type-desc">Business partnerships</div>
+              </div>
+            </label>
+          </div>
+          {fieldErrors.taxpayer_type && <p class="form-error">{fieldErrors.taxpayer_type}</p>}
+        </div>
+
+        <!-- Business name (shown for non-individual) -->
+        <div class="form-group" id="business-name-group">
+          <label class="form-label" for="business_name">Business / Organisation Name</label>
+          <input
+            id="business_name"
+            type="text"
+            name="business_name"
+            class="form-control"
+            placeholder="e.g. Kapherachoka Enterprises Ltd"
+          />
+          {fieldErrors.business_name && <p class="form-error">{fieldErrors.business_name}</p>}
+          <p class="form-hint">Required for companies and partnerships. Leave blank for individuals.</p>
+        </div>
+
+        <div class="two-col">
+          <div class="form-group">
+            <label class="form-label required" for="phone">Phone Number</label>
+            <input
+              id="phone"
+              type="tel"
+              name="phone"
+              class={`form-control ${fieldErrors.phone ? 'is-invalid' : ''}`}
+              placeholder="+265 999 000 000"
+              required
+            />
+            {fieldErrors.phone && <p class="form-error">{fieldErrors.phone}</p>}
+          </div>
+
+          <div class="form-group">
+            <label class="form-label required" for="address">Physical Address</label>
+            <input
+              id="address"
+              type="text"
+              name="address"
+              class={`form-control ${fieldErrors.address ? 'is-invalid' : ''}`}
+              placeholder="e.g. Area 3, Lilongwe"
+              required
+            />
+            {fieldErrors.address && <p class="form-error">{fieldErrors.address}</p>}
+          </div>
+        </div>
+
+        <!-- TIN notice -->
+        <div class="tin-notice">
+          <div class="tin-notice-icon">🔢</div>
+          <div>
+            <strong>Your TIN will be generated automatically</strong>
+            <p>Upon submission, the system will assign a unique Tax Identification Number in the format <code>IND-XXXXXXX</code>, <code>CMP-XXXXXXX</code>, or <code>PRT-XXXXXXX</code> based on your taxpayer type.</p>
+          </div>
+        </div>
+
+        <div style="display:flex; gap:1rem; margin-top:1.5rem;">
+          <button type="submit" class="btn btn-primary btn-lg">
+            Submit &amp; Get My TIN →
+          </button>
+          <a href="/dashboard" class="btn btn-ghost btn-lg">Do This Later</a>
+        </div>
+
+      </form>
+    </div>
+  </div>
+
+  <style>
+    .setup-steps {
+      display: flex;
+      align-items: center;
+      gap: 0;
+    }
+    .step {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.3rem;
+      font-size: 0.78rem;
+      color: var(--mra-gray-500);
+      min-width: 100px;
+    }
+    .step.active { color: var(--mra-green); font-weight: 600; }
+    .step.done { color: var(--mra-green); }
+    .step-dot {
+      width: 30px; height: 30px;
+      border-radius: 50%;
+      border: 2px solid var(--mra-gray-300);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 0.8rem; font-weight: 700;
+      background: #fff;
+    }
+    .step.active .step-dot { border-color: var(--mra-green); background: var(--mra-green); color: #fff; }
+    .step.done .step-dot  { border-color: var(--mra-green); background: var(--mra-green); color: #fff; font-size: 0.75rem; }
+    .step-line {
+      flex: 1;
+      height: 2px;
+      background: var(--mra-gray-200);
+      margin-bottom: 1.4rem;
+    }
+    .step-line.done { background: var(--mra-green); }
+
+    .prefilled-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+      background: var(--mra-gray-100);
+      border-radius: var(--radius);
+      padding: 1rem;
+      margin-bottom: 0.5rem;
+    }
+    .prefilled-value {
+      font-weight: 600;
+      font-size: 0.95rem;
+      color: var(--mra-gray-700);
+      margin-top: 0.2rem;
+    }
+
+    /* Type cards */
+    .type-cards {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 0.75rem;
+      margin-top: 0.5rem;
+    }
+    .type-card input[type="radio"] { display: none; }
+    .type-card-inner {
+      border: 2px solid var(--mra-gray-200);
+      border-radius: var(--radius);
+      padding: 1rem 0.75rem;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .type-card:hover .type-card-inner { border-color: var(--mra-green); background: var(--mra-green-light); }
+    .type-card input:checked + .type-card-inner {
+      border-color: var(--mra-green);
+      background: var(--mra-green-light);
+      box-shadow: 0 0 0 3px rgba(0,90,48,0.1);
+    }
+    .type-icon { font-size: 1.5rem; margin-bottom: 0.4rem; }
+    .type-name { font-weight: 700; font-size: 0.9rem; color: var(--mra-gray-900); }
+    .type-desc { font-size: 0.75rem; color: var(--mra-gray-500); margin-top: 0.15rem; }
+
+    .tin-notice {
+      display: flex;
+      gap: 1rem;
+      align-items: flex-start;
+      background: var(--mra-gold-light);
+      border: 1px solid #e6c96a;
+      border-left: 4px solid var(--mra-gold);
+      border-radius: var(--radius);
+      padding: 1rem 1.25rem;
+      font-size: 0.88rem;
+      color: #7a5800;
+      margin-top: 0.5rem;
+    }
+    .tin-notice-icon { font-size: 1.4rem; flex-shrink: 0; margin-top: 0.1rem; }
+    .tin-notice p { margin: 0.25rem 0 0; font-size: 0.83rem; }
+    .tin-notice code { font-family: var(--font-mono); background: rgba(0,0,0,0.06); padding: 0.1em 0.35em; border-radius: 3px; font-size: 0.82rem; }
+    .is-invalid { border-color: var(--mra-red) !important; }
+  </style>
+
+  <script>
+    // Show/hide business name based on type selection
+    const radios = document.querySelectorAll('input[name="taxpayer_type"]');
+    const bizGroup = document.getElementById('business-name-group');
+    const bizInput = document.getElementById('business_name') as HTMLInputElement;
+    const bizLabel = bizGroup?.querySelector('.form-label');
+
+    function updateBizField() {
+      const selected = (document.querySelector('input[name="taxpayer_type"]:checked') as HTMLInputElement)?.value;
+      if (selected === 'individual') {
+        if (bizInput) { bizInput.required = false; bizInput.value = ''; }
+        if (bizLabel) bizLabel.classList.remove('required');
+      } else {
+        if (bizInput) bizInput.required = true;
+        if (bizLabel) bizLabel.classList.add('required');
+      }
+    }
+
+    radios.forEach(r => r.addEventListener('change', updateBizField));
+    updateBizField();
+  </script>
+</DashLayout>

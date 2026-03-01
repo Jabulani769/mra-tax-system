@@ -1,0 +1,281 @@
+---
+import DashLayout from '../../layouts/DashLayout.astro';
+import { createSupabaseServer, formatMWK, formatDate } from '../../lib/supabase';
+
+const supabase = createSupabaseServer(Astro.cookies);
+const { data: { session } } = await supabase.auth.getSession();
+if (!session) return Astro.redirect('/login');
+
+const { data: userProfile } = await supabase
+  .from('users').select('*').eq('id', session.user.id).single();
+
+const role = userProfile?.role || 'taxpayer';
+
+// Get taxpayer record
+const { data: taxpayer } = await supabase
+  .from('taxpayers').select('*').eq('user_id', session.user.id).single();
+
+// Filter state from URL
+const statusFilter = Astro.url.searchParams.get('status') || 'all';
+const typeFilter   = Astro.url.searchParams.get('type') || 'all';
+
+let query;
+
+if (role === 'taxpayer') {
+  if (!taxpayer) return Astro.redirect('/profile/setup');
+  query = supabase
+    .from('tax_returns')
+    .select('*, taxpayers(tin, name)')
+    .eq('taxpayer_id', taxpayer.id)
+    .order('created_at', { ascending: false });
+} else {
+  // Officers/admins see all returns with taxpayer info
+  query = supabase
+    .from('tax_returns')
+    .select('*, taxpayers(tin, name, user_id)')
+    .order('created_at', { ascending: false })
+    .limit(100);
+}
+
+if (statusFilter !== 'all') query = query.eq('status', statusFilter);
+if (typeFilter   !== 'all') query = query.eq('tax_type', typeFilter);
+
+const { data: returns, error } = await query;
+
+// Summary counts
+const allReturns = returns || [];
+const counts = {
+  all:         allReturns.length,
+  draft:       allReturns.filter(r => r.status === 'draft').length,
+  submitted:   allReturns.filter(r => r.status === 'submitted').length,
+  under_review:allReturns.filter(r => r.status === 'under_review').length,
+  accepted:    allReturns.filter(r => r.status === 'accepted').length,
+  rejected:    allReturns.filter(r => r.status === 'rejected').length,
+};
+
+const statusBadge: Record<string, string> = {
+  draft:        'badge-gray',
+  submitted:    'badge-blue',
+  under_review: 'badge-yellow',
+  assessed:     'badge-orange',
+  accepted:     'badge-green',
+  rejected:     'badge-red',
+  amended:      'badge-orange',
+};
+
+const taxTypeLabel: Record<string, string> = {
+  income_tax:       'Income Tax',
+  vat:              'VAT',
+  withholding_tax:  'Withholding Tax',
+  corporate_tax:    'Corporate Tax',
+  pay_as_you_earn:  'PAYE',
+};
+---
+
+<DashLayout title="Tax Returns" activeNav="/returns">
+
+  <div class="page-header">
+    <div>
+      <h1 class="page-title">Tax Returns</h1>
+      <p class="page-subtitle">
+        {role === 'taxpayer'
+          ? 'View and manage your submitted tax returns'
+          : 'All taxpayer return submissions'}
+      </p>
+    </div>
+    {role === 'taxpayer' && (
+      <a href="/returns/new" class="btn btn-primary">+ File New Return</a>
+    )}
+  </div>
+
+  {/* Status tabs */}
+  <div class="status-tabs">
+    {[
+      { key: 'all',          label: 'All' },
+      { key: 'draft',        label: 'Draft' },
+      { key: 'submitted',    label: 'Submitted' },
+      { key: 'under_review', label: 'Under Review' },
+      { key: 'accepted',     label: 'Accepted' },
+      { key: 'rejected',     label: 'Rejected' },
+    ].map(tab => (
+      <a
+        href={`/returns?status=${tab.key}${typeFilter !== 'all' ? `&type=${typeFilter}` : ''}`}
+        class={`status-tab ${statusFilter === tab.key ? 'active' : ''}`}
+      >
+        {tab.label}
+        <span class="tab-count">{counts[tab.key as keyof typeof counts] ?? allReturns.length}</span>
+      </a>
+    ))}
+  </div>
+
+  {/* Filters row */}
+  <div class="filters-row">
+    <div class="filter-group">
+      <label class="filter-label">Tax Type</label>
+      <select
+        class="filter-select"
+        onchange={`window.location='/returns?status=${statusFilter}&type='+this.value`}
+      >
+        <option value="all" selected={typeFilter === 'all'}>All Types</option>
+        <option value="income_tax"      selected={typeFilter === 'income_tax'}>Income Tax</option>
+        <option value="vat"             selected={typeFilter === 'vat'}>VAT</option>
+        <option value="withholding_tax" selected={typeFilter === 'withholding_tax'}>Withholding Tax</option>
+        <option value="corporate_tax"   selected={typeFilter === 'corporate_tax'}>Corporate Tax</option>
+        <option value="pay_as_you_earn" selected={typeFilter === 'pay_as_you_earn'}>PAYE</option>
+      </select>
+    </div>
+    <div class="filter-meta">
+      Showing <strong>{allReturns.length}</strong> return{allReturns.length !== 1 ? 's' : ''}
+      {statusFilter !== 'all' && <> · Status: <strong>{statusFilter.replace('_', ' ')}</strong></>}
+      {typeFilter   !== 'all' && <> · Type: <strong>{taxTypeLabel[typeFilter]}</strong></>}
+    </div>
+  </div>
+
+  {/* Returns table */}
+  <div class="card" style="margin-top:1rem; padding:0;">
+    {allReturns.length > 0 ? (
+      <div class="table-wrapper" style="border:none;">
+        <table>
+          <thead>
+            <tr>
+              <th>Reference</th>
+              {role !== 'taxpayer' && <th>Taxpayer</th>}
+              <th>Tax Type</th>
+              <th>Period</th>
+              <th>Gross Income</th>
+              <th>Amount Due</th>
+              <th>Submitted</th>
+              <th>Status</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {allReturns.map(r => (
+              <tr>
+                <td>
+                  <a href={`/returns/${r.id}`} class="mono ref-link">{r.return_reference}</a>
+                </td>
+                {role !== 'taxpayer' && (
+                  <td>
+                    <div class="taxpayer-cell">
+                      <span class="taxpayer-name">{r.taxpayers?.name || '—'}</span>
+                      <span class="taxpayer-tin mono">{r.taxpayers?.tin || '—'}</span>
+                    </div>
+                  </td>
+                )}
+                <td>{taxTypeLabel[r.tax_type] || r.tax_type}</td>
+                <td class="text-sm text-muted">
+                  {formatDate(r.period_from)}<br/><span style="font-size:0.75rem;">to {formatDate(r.period_to)}</span>
+                </td>
+                <td class="mono">{formatMWK(r.gross_income || 0)}</td>
+                <td class="mono" style="font-weight:600;">{formatMWK(r.amount_due || 0)}</td>
+                <td class="text-sm text-muted">{r.submission_date ? formatDate(r.submission_date) : '—'}</td>
+                <td>
+                  <span class={`badge ${statusBadge[r.status] || 'badge-gray'}`}>
+                    {r.status.replace(/_/g, ' ')}
+                  </span>
+                </td>
+                <td>
+                  <a href={`/returns/${r.id}`} class="btn btn-ghost btn-sm">View</a>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    ) : (
+      <div class="empty-state">
+        <div class="empty-state-icon">📋</div>
+        <h3>No returns found</h3>
+        <p>
+          {statusFilter !== 'all' || typeFilter !== 'all'
+            ? 'Try clearing the filters to see all returns.'
+            : role === 'taxpayer'
+              ? 'You haven\'t filed any tax returns yet.'
+              : 'No returns have been submitted yet.'}
+        </p>
+        {role === 'taxpayer' && statusFilter === 'all' && (
+          <a href="/returns/new" class="btn btn-primary btn-sm">File Your First Return</a>
+        )}
+        {(statusFilter !== 'all' || typeFilter !== 'all') && (
+          <a href="/returns" class="btn btn-ghost btn-sm">Clear Filters</a>
+        )}
+      </div>
+    )}
+  </div>
+
+</DashLayout>
+
+<style>
+  /* Status tabs */
+  .status-tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 2px solid var(--mra-gray-200);
+    margin-bottom: 0;
+    overflow-x: auto;
+  }
+  .status-tab {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.7rem 1.1rem;
+    font-size: 0.86rem;
+    font-weight: 600;
+    color: var(--mra-gray-500);
+    text-decoration: none;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -2px;
+    white-space: nowrap;
+    transition: all 0.15s;
+  }
+  .status-tab:hover { color: var(--mra-green); text-decoration: none; }
+  .status-tab.active { color: var(--mra-green); border-bottom-color: var(--mra-green); }
+  .tab-count {
+    background: var(--mra-gray-200);
+    color: var(--mra-gray-600);
+    font-size: 0.72rem;
+    font-weight: 700;
+    padding: 0.1em 0.5em;
+    border-radius: 999px;
+    min-width: 20px;
+    text-align: center;
+  }
+  .status-tab.active .tab-count { background: var(--mra-green-light); color: var(--mra-green); }
+
+  /* Filters */
+  .filters-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.75rem 0;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+  }
+  .filter-group { display: flex; align-items: center; gap: 0.5rem; }
+  .filter-label { font-size: 0.82rem; font-weight: 600; color: var(--mra-gray-500); }
+  .filter-select {
+    padding: 0.35rem 2rem 0.35rem 0.7rem;
+    border: 1.5px solid var(--mra-gray-300);
+    border-radius: var(--radius);
+    font-size: 0.85rem;
+    font-family: var(--font-sans);
+    color: var(--mra-gray-900);
+    background: #fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%23666' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 0.6rem center;
+    appearance: none;
+    cursor: pointer;
+  }
+  .filter-select:focus { outline: none; border-color: var(--mra-green); }
+  .filter-meta { font-size: 0.83rem; color: var(--mra-gray-500); }
+
+  /* Table cells */
+  .ref-link {
+    font-size: 0.83rem;
+    color: var(--mra-green);
+    font-weight: 600;
+  }
+  .ref-link:hover { text-decoration: underline; }
+  .taxpayer-cell { display: flex; flex-direction: column; gap: 0.1rem; }
+  .taxpayer-name { font-size: 0.88rem; font-weight: 600; color: var(--mra-gray-900); }
+  .taxpayer-tin  { font-size: 0.75rem; color: var(--mra-gray-500); }
+</style>
