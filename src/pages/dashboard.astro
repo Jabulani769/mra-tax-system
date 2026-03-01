@@ -1,44 +1,296 @@
 ---
-// src/pages/dashboard.astro
-import { createSupabaseServer } from '../lib/supabase';
+import DashLayout from '../layouts/DashLayout.astro';
+import { createSupabaseServer, formatMWK, formatDate } from '../lib/supabase';
 
-const { cookies } = Astro;
-const supabase = createSupabaseServer(cookies);
+const supabase = createSupabaseServer(Astro.cookies);
 const { data: { session } } = await supabase.auth.getSession();
+if (!session) return Astro.redirect('/login');
 
-if (!session) {
-  return Astro.redirect('/login');
+const { data: userProfile } = await supabase.from('users').select('*').eq('id', session.user.id).single();
+const role = userProfile?.role || 'taxpayer';
+
+let stats: any = {};
+let recentReturns: any[] = [];
+let recentPayments: any[] = [];
+
+if (role === 'taxpayer') {
+  const { data: taxpayer } = await supabase.from('taxpayers').select('*').eq('user_id', session.user.id).single();
+  
+  if (taxpayer) {
+    const [returnsResult, paymentsResult, notifResult] = await Promise.all([
+      supabase.from('tax_returns').select('*').eq('taxpayer_id', taxpayer.id).order('created_at', { ascending: false }).limit(5),
+      supabase.from('payments').select('*').eq('taxpayer_id', taxpayer.id).order('created_at', { ascending: false }).limit(5),
+      supabase.from('notifications').select('*').eq('taxpayer_id', taxpayer.id).eq('is_read', false),
+    ]);
+    recentReturns = returnsResult.data || [];
+    recentPayments = paymentsResult.data || [];
+    
+    const totalDue = recentReturns.reduce((sum: number, r: any) => sum + (r.amount_due || 0), 0);
+    const totalPaid = recentReturns.reduce((sum: number, r: any) => sum + (r.amount_paid || 0), 0);
+    stats = {
+      totalReturns: recentReturns.length,
+      pendingReturns: recentReturns.filter((r: any) => ['submitted','under_review'].includes(r.status)).length,
+      amountDue: totalDue,
+      amountPaid: totalPaid,
+      balance: totalDue - totalPaid,
+      unreadNotifs: notifResult.data?.length || 0,
+      tin: taxpayer.tin,
+      taxpayerStatus: taxpayer.status,
+    };
+  }
+} else {
+  const [tpResult, returnResult, payResult, auditResult] = await Promise.all([
+    supabase.from('taxpayers').select('count', { count: 'exact', head: true }),
+    supabase.from('tax_returns').select('count', { count: 'exact', head: true }).in('status', ['submitted','under_review']),
+    supabase.from('payments').select('count', { count: 'exact', head: true }).eq('status', 'pending'),
+    supabase.from('audits').select('count', { count: 'exact', head: true }).in('status', ['initiated','in_progress']),
+  ]);
+  const [recentRet, recentPay] = await Promise.all([
+    supabase.from('tax_returns').select('*, taxpayers(name, tin)').order('created_at', { ascending: false }).limit(6),
+    supabase.from('payments').select('*, taxpayers(name, tin)').order('created_at', { ascending: false }).limit(5),
+  ]);
+  recentReturns = recentRet.data || [];
+  recentPayments = recentPay.data || [];
+  stats = {
+    totalTaxpayers: tpResult.count || 0,
+    pendingReturns: returnResult.count || 0,
+    pendingPayments: payResult.count || 0,
+    openAudits: auditResult.count || 0,
+  };
 }
 
-const userEmail = session.user.email;
-const userMetadata = session.user.user_metadata;
-const fullName = userMetadata?.full_name || 'User';
+function statusBadge(status: string) {
+  const map: Record<string, string> = {
+    draft: 'badge-gray', submitted: 'badge-blue', under_review: 'badge-yellow',
+    assessed: 'badge-orange', accepted: 'badge-green', rejected: 'badge-red',
+    amended: 'badge-orange', confirmed: 'badge-green', pending: 'badge-yellow', reversed: 'badge-red',
+  };
+  return map[status] || 'badge-gray';
+}
 ---
 
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Dashboard - MRA Tax System</title>
-  <style is:global>
-    body { font-family: system-ui, sans-serif; background: #f3f4f6; margin: 0; padding: 2rem; }
-    .card { max-width: 600px; margin: 0 auto; background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
-    .btn-logout { background: #ef4444; color: white; padding: 0.8rem 1.5rem; border: none; border-radius: 6px; cursor: pointer; }
-    .btn-logout:hover { background: #dc2626; }
-  </style>
-</head>
-<body>
+<DashLayout title="Dashboard" activeNav="/dashboard">
+  {role === 'taxpayer' && !stats.tin && (
+    <div class="alert alert-warning" style="margin-bottom: 20px;">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+      <div>
+        <strong>Complete your taxpayer profile</strong> — Your account is not yet linked to a TIN. 
+        <a href="/profile/setup">Complete registration →</a>
+      </div>
+    </div>
+  )}
 
-  <div class="card">
-    <h1>Welcome, {fullName}!</h1>
-    <p>Logged in as: {userEmail}</p>
-    <p>This is your MRA Taxpayer / Officer Dashboard (protected page).</p>
+  {role === 'taxpayer' && stats.tin && (
+    <div>
+      <!-- TIN Banner -->
+      <div class="tin-banner">
+        <div class="tin-info">
+          <span class="tin-label">Taxpayer ID (TIN)</span>
+          <span class="tin-number">{stats.tin}</span>
+          <span class={`badge ${stats.taxpayerStatus === 'active' ? 'badge-green' : 'badge-red'}`}>{stats.taxpayerStatus}</span>
+        </div>
+        <div class="tin-actions">
+          <a href="/returns/new" class="btn btn-primary btn-sm">+ File Return</a>
+          <a href="/payments/new" class="btn btn-secondary btn-sm">+ Record Payment</a>
+        </div>
+      </div>
 
-    <form method="POST" action="/api/logout">
-      <button type="submit" class="btn-logout">Log Out</button>
-    </form>
-  </div>
+      <!-- Stats -->
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-label">Total Returns Filed</div>
+          <div class="stat-value">{stats.totalReturns}</div>
+          <div class="stat-change">{stats.pendingReturns} pending review</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Total Amount Due</div>
+          <div class="stat-value">{formatMWK(stats.amountDue || 0)}</div>
+          <div class="stat-change">Across all returns</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Total Paid</div>
+          <div class="stat-value" style="color: var(--mra-green);">{formatMWK(stats.amountPaid || 0)}</div>
+          <div class="stat-change">Confirmed payments</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Outstanding Balance</div>
+          <div class="stat-value" style={stats.balance > 0 ? 'color: var(--mra-red)' : 'color: var(--mra-green)'}>{formatMWK(stats.balance || 0)}</div>
+          <div class="stat-change">{stats.unreadNotifs} unread notifications</div>
+        </div>
+      </div>
 
-</body>
-</html>
+      <!-- Recent Returns -->
+      <div class="section-pair">
+        <div class="card">
+          <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
+            <h3 style="font-size:15px;">Recent Tax Returns</h3>
+            <a href="/returns" class="btn btn-ghost btn-sm">View all →</a>
+          </div>
+          <div style="overflow-x:auto;">
+            {recentReturns.length === 0 ? (
+              <div class="empty-state">No tax returns filed yet. <a href="/returns/new">File your first return</a></div>
+            ) : (
+              <table>
+                <thead><tr><th>Reference</th><th>Tax Type</th><th>Period</th><th>Amount Due</th><th>Status</th></tr></thead>
+                <tbody>
+                  {recentReturns.map((r: any) => (
+                    <tr>
+                      <td><a href={`/returns/${r.id}`} class="mono">{r.return_reference}</a></td>
+                      <td style="text-transform:capitalize;">{r.tax_type.replace(/_/g,' ')}</td>
+                      <td class="text-small text-muted">{formatDate(r.period_from)}</td>
+                      <td class="mono">{formatMWK(r.amount_due)}</td>
+                      <td><span class={`badge ${statusBadge(r.status)}`}>{r.status}</span></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
+            <h3 style="font-size:15px;">Recent Payments</h3>
+            <a href="/payments" class="btn btn-ghost btn-sm">View all →</a>
+          </div>
+          <div style="overflow-x:auto;">
+            {recentPayments.length === 0 ? (
+              <div class="empty-state">No payments recorded yet.</div>
+            ) : (
+              <table>
+                <thead><tr><th>Reference</th><th>Amount</th><th>Date</th><th>Status</th></tr></thead>
+                <tbody>
+                  {recentPayments.map((p: any) => (
+                    <tr>
+                      <td class="mono">{p.payment_reference}</td>
+                      <td class="mono">{formatMWK(p.amount)}</td>
+                      <td class="text-small text-muted">{formatDate(p.payment_date)}</td>
+                      <td><span class={`badge ${statusBadge(p.status)}`}>{p.status}</span></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  )}
+
+  {(role === 'officer' || role === 'admin') && (
+    <div>
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-label">Registered Taxpayers</div>
+          <div class="stat-value">{stats.totalTaxpayers}</div>
+          <div class="stat-change">Active taxpayer accounts</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Returns Pending Review</div>
+          <div class="stat-value" style="color: var(--mra-gold);">{stats.pendingReturns}</div>
+          <div class="stat-change">Requires officer assessment</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Pending Payments</div>
+          <div class="stat-value" style="color: var(--mra-gold);">{stats.pendingPayments}</div>
+          <div class="stat-change">Awaiting confirmation</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Open Audits</div>
+          <div class="stat-value" style="color: var(--mra-red);">{stats.openAudits}</div>
+          <div class="stat-change">Active audit cases</div>
+        </div>
+      </div>
+
+      <div class="section-pair">
+        <div class="card">
+          <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
+            <h3 style="font-size:15px;">Recent Submissions</h3>
+            <a href="/returns" class="btn btn-ghost btn-sm">View all →</a>
+          </div>
+          <div style="overflow-x:auto;">
+            {recentReturns.length === 0 ? (
+              <div class="empty-state">No recent submissions.</div>
+            ) : (
+              <table>
+                <thead><tr><th>Reference</th><th>Taxpayer</th><th>Tax Type</th><th>Amount</th><th>Status</th></tr></thead>
+                <tbody>
+                  {recentReturns.map((r: any) => (
+                    <tr>
+                      <td><a href={`/returns/${r.id}`} class="mono">{r.return_reference}</a></td>
+                      <td>{r.taxpayers?.name || '—'}<br/><span class="mono text-small text-muted">{r.taxpayers?.tin}</span></td>
+                      <td style="text-transform:capitalize;">{r.tax_type.replace(/_/g,' ')}</td>
+                      <td class="mono">{formatMWK(r.amount_due)}</td>
+                      <td><span class={`badge ${statusBadge(r.status)}`}>{r.status}</span></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
+            <h3 style="font-size:15px;">Quick Actions</h3>
+          </div>
+          <div class="quick-actions">
+            <a href="/taxpayers" class="qa-item">
+              <span class="qa-icon">◎</span>
+              <div><div class="qa-label">Manage Taxpayers</div><div class="qa-desc">View, verify & update taxpayer records</div></div>
+            </a>
+            <a href="/returns" class="qa-item">
+              <span class="qa-icon">⊡</span>
+              <div><div class="qa-label">Process Returns</div><div class="qa-desc">Review & assess submitted tax returns</div></div>
+            </a>
+            <a href="/audits/new" class="qa-item">
+              <span class="qa-icon">◧</span>
+              <div><div class="qa-label">Initiate Audit</div><div class="qa-desc">Create a new audit case for a taxpayer</div></div>
+            </a>
+            <a href="/compliance" class="qa-item">
+              <span class="qa-icon">◉</span>
+              <div><div class="qa-label">Compliance Monitor</div><div class="qa-desc">Identify non-filers & overdue payments</div></div>
+            </a>
+            {role === 'admin' && (
+              <a href="/users" class="qa-item">
+                <span class="qa-icon">◫</span>
+                <div><div class="qa-label">User Management</div><div class="qa-desc">Manage MRA staff accounts & roles</div></div>
+              </a>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  )}
+</DashLayout>
+
+<style>
+.tin-banner {
+  background: var(--mra-green-dark); color: white; padding: 16px 20px;
+  border-radius: var(--radius-md); margin-bottom: 24px;
+  display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;
+}
+.tin-info { display: flex; align-items: center; gap: 12px; }
+.tin-label { font-size: 11px; color: rgba(255,255,255,0.6); text-transform: uppercase; letter-spacing: 0.08em; }
+.tin-number { font-family: var(--font-mono); font-size: 18px; color: #FFD700; font-weight: 600; }
+.tin-actions { display: flex; gap: 8px; }
+
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+
+.section-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+@media (max-width: 900px) { .section-pair { grid-template-columns: 1fr; } }
+
+.empty-state { padding: 32px; text-align: center; color: var(--mra-gray-400); font-size: 14px; }
+
+.quick-actions { padding: 8px 0; }
+.qa-item {
+  display: flex; align-items: center; gap: 12px; padding: 12px 20px;
+  text-decoration: none; color: var(--mra-black); transition: background 0.15s;
+  border-bottom: 1px solid var(--mra-gray-100);
+}
+.qa-item:last-child { border-bottom: none; }
+.qa-item:hover { background: var(--mra-gray-50); text-decoration: none; }
+.qa-icon { font-size: 20px; width: 32px; text-align: center; color: var(--mra-green); }
+.qa-label { font-size: 14px; font-weight: 600; }
+.qa-desc { font-size: 12px; color: var(--mra-gray-400); margin-top: 2px; }
+</style>

@@ -1,75 +1,124 @@
 ---
-// src/pages/login.astro
+import Layout from '../layouts/Layout.astro';
 import { createSupabaseServer } from '../lib/supabase';
 
-const { cookies } = Astro;
-const supabase = createSupabaseServer(cookies);
-const session = await supabase.auth.getSession();
-
-if (session.data.session) {
-  return Astro.redirect('/dashboard');
-}
+const supabase = createSupabaseServer(Astro.cookies);
+const { data: { session } } = await supabase.auth.getSession();
+if (session) return Astro.redirect('/dashboard');
 
 let errorMessage = '';
 
 if (Astro.request.method === 'POST') {
-  const formData = await Astro.request.formData();
-  const email = formData.get('email')?.toString();
-  const password = formData.get('password')?.toString();
-
+  const form = await Astro.request.formData();
+  const email = form.get('email')?.toString() || '';
+  const password = form.get('password')?.toString() || '';
   if (email && password) {
-    const { error } = await supabase.auth.signInWithPassword({
-      email,
-      password,
-    });
-
-    if (error) {
-      errorMessage = error.message;
-    } else {
-      return Astro.redirect('/dashboard');
-    }
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) errorMessage = error.message;
+    else return Astro.redirect('/dashboard');
   } else {
-    errorMessage = 'Email and password required.';
+    errorMessage = 'Email and password are required.';
   }
 }
 ---
 
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Log In - MRA Tax System</title>
-  <style is:global> /* same styles as signup */ 
-    body { font-family: system-ui, sans-serif; background: #f3f4f6; margin: 0; padding: 2rem; }
-    .card { max-width: 420px; margin: 0 auto; background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
-    input { display: block; width: 100%; padding: 0.75rem; margin: 0.5rem 0; border: 1px solid #d1d5db; border-radius: 6px; }
-    button { width: 100%; padding: 0.9rem; background: #3b82f6; color: white; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; }
-    button:hover { background: #2563eb; }
-    .error { color: #dc2626; font-size: 0.9rem; margin-top: 0.5rem; }
-  </style>
-</head>
-<body>
+<Layout title="Sign In">
+  <div class="auth-page">
+    <div class="auth-banner">
+      <div class="banner-content">
+        <div class="banner-emblem">
+          <img src="https://www.mra.mw/images/MRA%20AT%2025%20LOGO%20FINAL-01.png" alt="MRA Emblem" style="width: 100%; height: auto;" />
+        </div>
+        <h1>Malawi Revenue Authority</h1>
+        <p>Taxpayer Management System</p>
+        <div class="banner-divider"></div>
+        <!-- <div class="banner-tagline">
+          <span>Serving the Nation</span>
+          <span class="dot">·</span>
+          <span>Collecting Revenue</span>
+          <span class="dot">·</span>
+          <span>Building Malawi</span>
+        </div> -->
+      </div>
+    </div>
 
-  <div class="card">
-    <h1 style="text-align:center; color:#1e40af;">MRA Tax Login</h1>
+    <div class="auth-panel">
+      <div class="auth-box">
+        <div class="auth-header">
+          <h2>Welcome Back</h2>
+          <p>Sign in to your MRA account</p>
+        </div>
 
-    {errorMessage && <p class="error">{errorMessage}</p>}
+        {errorMessage && (
+          <div class="alert alert-error">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+            {errorMessage}
+          </div>
+        )}
 
-    <form method="POST">
-      <label>Email</label>
-      <input type="email" name="email" required />
+        <form method="POST" class="auth-form">
+          <div class="form-group">
+            <label class="form-label">Email Address</label>
+            <input class="form-input" type="email" name="email" placeholder="Email" required autocomplete="email" />
+          </div>
+          <div class="form-group">
+            <label class="form-label">Password</label>
+            <input class="form-input" type="password" name="password" placeholder="Password" required autocomplete="current-password" />
+          </div>
+          <button type="submit" class="btn btn-primary btn-full">Sign In →</button>
+        </form>
 
-      <label>Password</label>
-      <input type="password" name="password" required />
-
-      <button type="submit">Log In</button>
-    </form>
-
-    <p style="text-align:center; margin-top:1.5rem;">
-      New user? <a href="/signup" style="color:#3b82f6;">Sign up</a>
-    </p>
+        <div class="auth-footer">
+          <p>No account? <a href="/signup">Register as Taxpayer</a></p>
+        </div>
+      </div>
+    </div>
   </div>
+</Layout>
 
-</body>
-</html>
+<style>
+.auth-page { display: flex; min-height: 100vh; }
+
+.auth-banner {
+  width: 45%; background: var(--mra-green-dark);
+  display: flex; align-items: center; justify-content: center;
+  position: relative; overflow: hidden;
+}
+.auth-banner::before {
+  content: ''; position: absolute; inset: 0;
+  background: repeating-linear-gradient(45deg, transparent, transparent 40px, rgba(255,255,255,0.02) 40px, rgba(255,255,255,0.02) 80px);
+}
+
+.banner-content { text-align: center; color: white; position: relative; z-index: 1; padding: 40px; }
+.banner-flag { display: flex; gap: 6px; justify-content: center; margin-bottom: 24px; }
+.flag-bar { height: 32px; width: 10px; border-radius: 2px; }
+.bar-black { background: #222; }
+.bar-red { background: #CE1126; }
+.bar-white { background: rgba(255,255,255,0.9); }
+.bar-green { background: #009A44; }
+
+.banner-emblem { font-size: 60px; margin-bottom: 16px; display: block; }
+.banner-content h1 { font-family: var(--font-serif); font-size: 28px; margin-bottom: 8px; color: #FFD700; }
+.banner-content p { font-size: 15px; color: rgba(255,255,255,0.7); margin-bottom: 24px; }
+.banner-divider { width: 40px; height: 2px; background: rgba(255,215,0,0.5); margin: 0 auto 20px; }
+.banner-tagline { display: flex; align-items: center; gap: 8px; font-size: 12px; color: rgba(255,255,255,0.5); flex-wrap: wrap; justify-content: center; }
+.dot { color: #FFD700; }
+
+.auth-panel {
+  flex: 1; display: flex; align-items: center; justify-content: center;
+  padding: 40px; background: var(--mra-gray-50);
+}
+.auth-box { width: 100%; max-width: 420px; }
+.auth-header { margin-bottom: 28px; }
+.auth-header h2 { font-family: var(--font-serif); font-size: 26px; color: var(--mra-black); margin-bottom: 6px; }
+.auth-header p { color: var(--mra-gray-400); font-size: 15px; }
+
+.auth-form .btn-full { width: 100%; justify-content: center; padding: 13px; font-size: 15px; margin-top: 8px; }
+.auth-footer { margin-top: 24px; text-align: center; font-size: 14px; color: var(--mra-gray-400); }
+.auth-footer a { color: var(--mra-green); font-weight: 600; }
+
+@media (max-width: 768px) {
+  .auth-banner { display: none; }
+  .auth-panel { padding: 24px; }
+}
+</style>

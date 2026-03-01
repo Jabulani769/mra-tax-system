@@ -1,0 +1,191 @@
+---
+import Layout from './Layout.astro';
+import { createSupabaseServer } from '../lib/supabase';
+
+export interface Props {
+  title?: string;
+  activeNav?: string;
+}
+
+const { title = 'Dashboard', activeNav = '' } = Astro.props;
+const { cookies } = Astro;
+const supabase = createSupabaseServer(cookies);
+const { data: { session } } = await supabase.auth.getSession();
+
+if (!session) {
+  return Astro.redirect('/login');
+}
+
+const { data: userProfile } = await supabase
+  .from('users')
+  .select('*')
+  .eq('id', session.user.id)
+  .single();
+
+const role = userProfile?.role || 'taxpayer';
+const fullName = userProfile?.full_name || session.user.email;
+
+const taxpayerNav = [
+  { href: '/dashboard', icon: '⊞', label: 'Dashboard' },
+  { href: '/profile', icon: '◎', label: 'My Profile' },
+  { href: '/returns', icon: '⊡', label: 'Tax Returns' },
+  { href: '/payments', icon: '◈', label: 'Payments' },
+  { href: '/notifications', icon: '◉', label: 'Notifications' },
+];
+
+const officerNav = [
+  { href: '/dashboard', icon: '⊞', label: 'Dashboard' },
+  { href: '/taxpayers', icon: '◎', label: 'Taxpayers' },
+  { href: '/returns', icon: '⊡', label: 'Tax Returns' },
+  { href: '/payments', icon: '◈', label: 'Payments' },
+  { href: '/audits', icon: '◧', label: 'Audits' },
+  { href: '/compliance', icon: '◉', label: 'Compliance' },
+  { href: '/reports', icon: '◨', label: 'Reports' },
+];
+
+const adminNav = [
+  ...officerNav,
+  { href: '/users', icon: '◫', label: 'User Management' },
+  { href: '/logs', icon: '⊟', label: 'Audit Logs' },
+];
+
+const navItems = role === 'admin' ? adminNav : role === 'officer' ? officerNav : taxpayerNav;
+---
+
+<Layout title={title}>
+  <div class="dash-shell">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-logo">
+        <div class="logo-emblem">
+          <span class="logo-mw">🦅</span>
+        </div>
+        <div class="logo-text">
+          <span class="logo-mra">MRA</span>
+          <span class="logo-sub">Revenue Authority</span>
+        </div>
+      </div>
+
+      <nav class="sidebar-nav">
+        {navItems.map(item => (
+          <a 
+            href={item.href} 
+            class={`nav-item ${activeNav === item.href || (activeNav === '' && item.href === '/dashboard') ? 'nav-item--active' : ''}`}
+          >
+            <span class="nav-icon">{item.icon}</span>
+            <span class="nav-label">{item.label}</span>
+          </a>
+        ))}
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="user-chip">
+          <div class="user-avatar">{fullName.charAt(0).toUpperCase()}</div>
+          <div class="user-info">
+            <div class="user-name">{fullName}</div>
+            <div class="user-role">{role.charAt(0).toUpperCase() + role.slice(1)}</div>
+          </div>
+        </div>
+        <form method="POST" action="/api/logout">
+          <button type="submit" class="logout-btn" title="Sign out">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+              <polyline points="16 17 21 12 16 7"/>
+              <line x1="21" y1="12" x2="9" y2="12"/>
+            </svg>
+          </button>
+        </form>
+      </div>
+    </aside>
+
+    <!-- Main -->
+    <main class="dash-main">
+      <div class="dash-topbar">
+        <div class="topbar-title">
+          <h1>{title}</h1>
+        </div>
+        <div class="topbar-right">
+          <span class="topbar-date">{new Date().toLocaleDateString('en-GB', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}</span>
+        </div>
+      </div>
+      <div class="dash-content">
+        <slot />
+      </div>
+    </main>
+  </div>
+</Layout>
+
+<style>
+.dash-shell {
+  display: flex; height: 100vh; overflow: hidden;
+  background: var(--mra-gray-50);
+}
+
+.sidebar {
+  width: 240px; flex-shrink: 0;
+  background: var(--mra-green-dark);
+  display: flex; flex-direction: column;
+  border-right: none;
+}
+
+.sidebar-logo {
+  display: flex; align-items: center; gap: 12px;
+  padding: 20px 16px; border-bottom: 1px solid rgba(255,255,255,0.1);
+}
+.logo-emblem { font-size: 28px; line-height: 1; }
+.logo-text { display: flex; flex-direction: column; }
+.logo-mra { font-family: var(--font-serif); font-size: 20px; font-weight: 700; color: #FFD700; letter-spacing: 0.1em; }
+.logo-sub { font-size: 10px; color: rgba(255,255,255,0.6); letter-spacing: 0.08em; text-transform: uppercase; }
+
+.sidebar-nav {
+  flex: 1; padding: 12px 0; overflow-y: auto;
+}
+.nav-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 16px; color: rgba(255,255,255,0.7);
+  font-size: 13.5px; font-weight: 500;
+  transition: all 0.15s; text-decoration: none;
+  border-left: 3px solid transparent;
+}
+.nav-item:hover { background: rgba(255,255,255,0.08); color: white; text-decoration: none; }
+.nav-item--active { background: rgba(255,255,255,0.12); color: white; border-left-color: #FFD700; }
+.nav-icon { font-size: 16px; width: 20px; text-align: center; opacity: 0.8; }
+.nav-label { letter-spacing: 0.01em; }
+
+.sidebar-footer {
+  padding: 12px 16px; border-top: 1px solid rgba(255,255,255,0.1);
+  display: flex; align-items: center; gap: 8px;
+}
+.user-chip { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; }
+.user-avatar {
+  width: 32px; height: 32px; background: #FFD700; color: var(--mra-green-dark);
+  border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 700; flex-shrink: 0;
+}
+.user-info { min-width: 0; }
+.user-name { font-size: 13px; color: white; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.user-role { font-size: 11px; color: rgba(255,255,255,0.5); text-transform: uppercase; letter-spacing: 0.06em; }
+.logout-btn {
+  padding: 6px; background: rgba(255,255,255,0.1); border: none; border-radius: var(--radius);
+  color: rgba(255,255,255,0.6); cursor: pointer; display: flex; align-items: center;
+  transition: all 0.15s; flex-shrink: 0;
+}
+.logout-btn:hover { background: rgba(255,255,255,0.2); color: white; }
+
+.dash-main { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
+
+.dash-topbar {
+  background: white; padding: 0 28px; height: 56px;
+  display: flex; align-items: center; justify-content: space-between;
+  border-bottom: 1px solid var(--mra-gray-100);
+  box-shadow: var(--shadow-sm);
+}
+.topbar-title h1 {
+  font-family: var(--font-serif); font-size: 18px; color: var(--mra-black); font-weight: 700;
+}
+.topbar-date { font-size: 13px; color: var(--mra-gray-400); font-family: var(--font-mono); }
+
+.dash-content {
+  flex: 1; overflow-y: auto; padding: 28px;
+}
+</style>

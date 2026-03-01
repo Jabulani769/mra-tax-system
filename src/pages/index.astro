@@ -1,31 +1,7 @@
 ---
-import { supabase } from '../lib/supabase'
-const { data: { session } } = await supabase.auth.getSession()
-
-const message = session
-  ? `Hello ${session.user.email} — you're logged in!`
-  : "Not logged in yet (that's okay for this test)"
+import { createSupabaseServer } from '../lib/supabase';
+const supabase = createSupabaseServer(Astro.cookies);
+const { data: { session } } = await supabase.auth.getSession();
+if (session) return Astro.redirect('/dashboard');
+return Astro.redirect('/login');
 ---
-
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width" />
-    <title>MRA Tax System — Test</title>
-  </head>
-  <body class="bg-gray-100 p-8">
-    <h1 class="text-3xl font-bold text-blue-800 mb-6">
-      MRA Taxpayer Management System
-    </h1>
-    
-    <div class="bg-white p-6 rounded-lg shadow-md max-w-md">
-      <p class="text-lg">{message}</p>
-      
-      <p class="mt-4 text-sm text-gray-600">
-        If you see "Not logged in yet" → perfect, connection works!<br />
-        (We'll add login next)
-      </p>
-    </div>
-  </body>
-</html>
