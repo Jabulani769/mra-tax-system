@@ -1,0 +1,535 @@
+---
+import DashLayout from '../../layouts/DashLayout.astro';
+import { createSupabaseServer, formatMWK, formatDate } from '../../lib/supabase';
+
+const supabase = createSupabaseServer(Astro.cookies);
+const { data: { session } } = await supabase.auth.getSession();
+if (!session) return Astro.redirect('/login');
+
+const { data: userProfile } = await supabase
+  .from('users').select('*').eq('id', session.user.id).single();
+const role = userProfile?.role || 'taxpayer';
+
+const { data: taxpayer } = await supabase
+  .from('taxpayers').select('*').eq('user_id', session.user.id).single();
+
+if (!taxpayer) return Astro.redirect('/profile/setup');
+
+// Pre-select a return if coming from return detail page
+const preselectedReturnId = Astro.url.searchParams.get('return_id') || '';
+
+// Load accepted/assessed returns that still have a balance
+const { data: openReturns } = await supabase
+  .from('tax_returns')
+  .select('id, return_reference, tax_type, amount_due, amount_paid, balance, period_from, period_to')
+  .eq('taxpayer_id', taxpayer.id)
+  .in('status', ['accepted', 'assessed', 'submitted'])
+  .order('created_at', { ascending: false });
+
+let errorMessage = '';
+let fieldErrors: Record<string, string> = {};
+
+if (Astro.request.method === 'POST') {
+  const form = await Astro.request.formData();
+
+  const returnId      = form.get('return_id')?.toString() || null;
+  const amount        = parseFloat(form.get('amount')?.toString() || '0') || 0;
+  const paymentDate   = form.get('payment_date')?.toString() || '';
+  const paymentMethod = form.get('payment_method')?.toString() || '';
+  const taxType       = form.get('tax_type')?.toString() || '';
+  const bankName      = form.get('bank_name')?.toString().trim() || '';
+  const transactionRef= form.get('transaction_ref')?.toString().trim() || '';
+  const notes         = form.get('notes')?.toString().trim() || '';
+
+  // Validation
+  if (amount <= 0)     fieldErrors.amount        = 'Amount must be greater than zero.';
+  if (!paymentDate)    fieldErrors.payment_date   = 'Payment date is required.';
+  if (!paymentMethod)  fieldErrors.payment_method = 'Please select a payment method.';
+  if (!taxType)        fieldErrors.tax_type       = 'Please select a tax type.';
+
+  if (Object.keys(fieldErrors).length === 0) {
+    const year    = new Date().getFullYear();
+    const randNum = Math.floor(Math.random() * 9000000) + 1000000;
+    const paymentReference = `PAY-${year}-${randNum}`;
+
+    const { data: newPayment, error } = await supabase
+      .from('payments')
+      .insert({
+        taxpayer_id:       taxpayer.id,
+        return_id:         returnId || null,
+        payment_reference: paymentReference,
+        amount,
+        payment_date:      paymentDate,
+        payment_method:    paymentMethod,
+        tax_type:          taxType,
+        bank_name:         bankName || null,
+        transaction_ref:   transactionRef || null,
+        notes:             notes || null,
+        status:            'pending',
+      })
+      .select()
+      .single();
+
+    if (error) {
+      errorMessage = error.message;
+    } else {
+      // Audit log
+      await supabase.from('audit_logs').insert({
+        user_id:    session.user.id,
+        action:     'CREATE',
+        table_name: 'payments',
+        record_id:  newPayment.id,
+        new_values: { payment_reference: paymentReference, amount, status: 'pending' },
+      });
+
+      return Astro.redirect(`/payments?saved=1`);
+    }
+  }
+}
+
+const taxTypeLabel: Record<string, string> = {
+  income_tax:      'Income Tax',
+  vat:             'VAT',
+  withholding_tax: 'Withholding Tax',
+  corporate_tax:   'Corporate Tax',
+  pay_as_you_earn: 'PAYE',
+};
+
+// Pre-fill amount from selected return
+const preselectedReturn = openReturns?.find(r => r.id === preselectedReturnId);
+const prefilledAmount   = preselectedReturn ? Math.abs(preselectedReturn.balance || preselectedReturn.amount_due || 0) : '';
+const today = new Date().toISOString().split('T')[0];
+---
+
+<DashLayout title="Record Payment" activeNav="/payments">
+
+  <div class="page-header">
+    <div>
+      <h1 class="page-title">Record a Payment</h1>
+      <p class="page-subtitle">TIN: <span class="mono" style="font-weight:600;">{taxpayer.tin}</span> · {taxpayer.name}</p>
+    </div>
+    <a href="/payments" class="btn btn-ghost">← Back to Payments</a>
+  </div>
+
+  <div class="payment-layout">
+
+    <!-- Form -->
+    <div>
+      {errorMessage && <div class="alert alert-danger" style="margin-bottom:1.25rem;">{errorMessage}</div>}
+
+      <form method="POST" id="payment-form">
+
+        <!-- Link to a return -->
+        <div class="card form-section">
+          <div class="section-header">
+            <div class="section-num">1</div>
+            <div>
+              <h2 class="section-title">Link to Tax Return</h2>
+              <p class="section-desc">Optionally link this payment to a specific open return.</p>
+            </div>
+          </div>
+
+          {openReturns && openReturns.length > 0 ? (
+            <div class="form-group">
+              <label class="form-label" for="return_id">Tax Return (optional)</label>
+              <select id="return_id" name="return_id" class="form-control" onchange="handleReturnSelect(this)">
+                <option value="">— Not linked to a specific return —</option>
+                {openReturns.map(r => (
+                  <option
+                    value={r.id}
+                    selected={r.id === preselectedReturnId}
+                    data-amount={Math.abs(r.balance || r.amount_due || 0)}
+                    data-type={r.tax_type}
+                  >
+                    {r.return_reference} · {taxTypeLabel[r.tax_type]} · Due: {formatMWK(r.amount_due)} · {formatDate(r.period_from)}–{formatDate(r.period_to)}
+                  </option>
+                ))}
+              </select>
+              <p class="form-hint">Linking helps reconcile your balance automatically.</p>
+            </div>
+          ) : (
+            <div class="alert alert-info">
+              No open returns found. You can still record a general payment without linking to a return.
+            </div>
+          )}
+
+          <div class="form-group">
+            <label class="form-label required" for="tax_type">Tax Type</label>
+            <select id="tax_type" name="tax_type" class={`form-control ${fieldErrors.tax_type ? 'is-invalid' : ''}`} required>
+              <option value="">Select tax type...</option>
+              <option value="income_tax"      selected={preselectedReturn?.tax_type === 'income_tax'}>Income Tax</option>
+              <option value="vat"             selected={preselectedReturn?.tax_type === 'vat'}>VAT</option>
+              <option value="withholding_tax" selected={preselectedReturn?.tax_type === 'withholding_tax'}>Withholding Tax</option>
+              <option value="corporate_tax"   selected={preselectedReturn?.tax_type === 'corporate_tax'}>Corporate Tax</option>
+              <option value="pay_as_you_earn" selected={preselectedReturn?.tax_type === 'pay_as_you_earn'}>PAYE</option>
+            </select>
+            {fieldErrors.tax_type && <p class="form-error">{fieldErrors.tax_type}</p>}
+          </div>
+        </div>
+
+        <!-- Payment details -->
+        <div class="card form-section" style="margin-top:1.25rem;">
+          <div class="section-header">
+            <div class="section-num">2</div>
+            <div>
+              <h2 class="section-title">Payment Details</h2>
+              <p class="section-desc">Enter the amount, date, and how the payment was made.</p>
+            </div>
+          </div>
+
+          <div class="two-col">
+            <div class="form-group">
+              <label class="form-label required" for="amount">Amount (MWK)</label>
+              <div class="input-prefix-wrap">
+                <span class="input-prefix">MWK</span>
+                <input
+                  id="amount"
+                  type="number"
+                  name="amount"
+                  class={`form-control has-prefix ${fieldErrors.amount ? 'is-invalid' : ''}`}
+                  placeholder="0.00"
+                  min="0.01"
+                  step="0.01"
+                  value={prefilledAmount}
+                  required
+                />
+              </div>
+              {fieldErrors.amount && <p class="form-error">{fieldErrors.amount}</p>}
+            </div>
+
+            <div class="form-group">
+              <label class="form-label required" for="payment_date">Payment Date</label>
+              <input
+                id="payment_date"
+                type="date"
+                name="payment_date"
+                class={`form-control ${fieldErrors.payment_date ? 'is-invalid' : ''}`}
+                value={today}
+                max={today}
+                required
+              />
+              {fieldErrors.payment_date && <p class="form-error">{fieldErrors.payment_date}</p>}
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label required">Payment Method</label>
+            <div class="method-grid">
+              {[
+                { value: 'bank_transfer', label: 'Bank Transfer', icon: '🏦' },
+                { value: 'mobile_money',  label: 'Mobile Money',  icon: '📱' },
+                { value: 'cash',          label: 'Cash',          icon: '💵' },
+                { value: 'cheque',        label: 'Cheque',        icon: '📄' },
+              ].map(m => (
+                <label class="method-option">
+                  <input type="radio" name="payment_method" value={m.value} required />
+                  <div class="method-option-inner">
+                    <span class="method-icon">{m.icon}</span>
+                    <span class="method-label">{m.label}</span>
+                  </div>
+                </label>
+              ))}
+            </div>
+            {fieldErrors.payment_method && <p class="form-error">{fieldErrors.payment_method}</p>}
+          </div>
+        </div>
+
+        <!-- Bank details -->
+        <div class="card form-section" style="margin-top:1.25rem;">
+          <div class="section-header">
+            <div class="section-num">3</div>
+            <div>
+              <h2 class="section-title">Bank / Transaction Details</h2>
+              <p class="section-desc">Provide proof of payment details for verification by MRA.</p>
+            </div>
+          </div>
+
+          <div class="two-col">
+            <div class="form-group">
+              <label class="form-label" for="bank_name">Bank Name</label>
+              <input
+                id="bank_name"
+                type="text"
+                name="bank_name"
+                class="form-control"
+                placeholder="e.g. National Bank of Malawi"
+              />
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="transaction_ref">Transaction / Receipt Reference</label>
+              <input
+                id="transaction_ref"
+                type="text"
+                name="transaction_ref"
+                class="form-control"
+                placeholder="e.g. TXN-20240115-001"
+              />
+              <p class="form-hint">Bank transaction ID or receipt number.</p>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="notes">Additional Notes</label>
+            <textarea
+              id="notes"
+              name="notes"
+              class="form-control"
+              rows="2"
+              placeholder="Any additional information..."
+            ></textarea>
+          </div>
+
+          <div class="pending-notice">
+            <span>⏳</span>
+            <span>Your payment will be recorded as <strong>Pending</strong> until confirmed by an MRA officer.</span>
+          </div>
+
+          <div class="form-actions" style="margin-top:1.25rem;">
+            <button type="submit" class="btn btn-primary btn-lg">Submit Payment Record →</button>
+            <a href="/payments" class="btn btn-ghost btn-lg">Cancel</a>
+          </div>
+        </div>
+
+      </form>
+    </div>
+
+    <!-- Summary panel -->
+    <div>
+      <div class="card summary-card" style="position:sticky; top:1.5rem;">
+        <h3 class="summary-title">Payment Summary</h3>
+
+        <div class="summary-tin">
+          <span class="mono">{taxpayer.tin}</span>
+          <span class={`badge ${taxpayer.verification_status === 'verified' ? 'badge-green' : 'badge-yellow'}`}>
+            {taxpayer.verification_status}
+          </span>
+        </div>
+
+        <div class="summary-rows">
+          <div class="summary-row">
+            <span class="summary-label">Taxpayer</span>
+            <span class="summary-value">{taxpayer.name}</span>
+          </div>
+          <div class="summary-row">
+            <span class="summary-label">Amount</span>
+            <span class="summary-value mono" id="summary-amount">MWK —</span>
+          </div>
+          <div class="summary-row">
+            <span class="summary-label">Date</span>
+            <span class="summary-value" id="summary-date">—</span>
+          </div>
+          <div class="summary-row">
+            <span class="summary-label">Method</span>
+            <span class="summary-value" id="summary-method">—</span>
+          </div>
+          <div class="summary-row">
+            <span class="summary-label">Linked Return</span>
+            <span class="summary-value mono" id="summary-return" style="font-size:0.78rem;">None</span>
+          </div>
+        </div>
+
+        <div class="summary-status">
+          <span class="badge badge-yellow" style="font-size:0.8rem; padding:0.4em 1em;">Pending Confirmation</span>
+        </div>
+
+        {openReturns && openReturns.length > 0 && (
+          <div class="open-returns-mini">
+            <div class="mini-label">Open Returns</div>
+            {openReturns.slice(0, 3).map(r => (
+              <div class="mini-return">
+                <span class="mono" style="font-size:0.75rem;">{r.return_reference}</span>
+                <span style="font-size:0.75rem; color:var(--mra-red); font-weight:600;">{formatMWK(r.amount_due)}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+
+  </div>
+
+</DashLayout>
+
+<style>
+  .payment-layout {
+    display: grid;
+    grid-template-columns: 1fr 260px;
+    gap: 1.5rem;
+    align-items: start;
+  }
+  @media (max-width: 900px) {
+    .payment-layout { grid-template-columns: 1fr; }
+  }
+
+  .form-section { padding: 1.5rem; }
+  .section-header {
+    display: flex; align-items: flex-start; gap: 1rem;
+    margin-bottom: 1.5rem; padding-bottom: 1rem;
+    border-bottom: 1px solid var(--mra-gray-200);
+  }
+  .section-num {
+    width: 32px; height: 32px; border-radius: 50%;
+    background: var(--mra-green); color: #fff;
+    font-weight: 700; font-size: 0.9rem;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .section-title { font-size: 1rem; margin: 0 0 0.2rem; }
+  .section-desc  { font-size: 0.83rem; color: var(--mra-gray-500); margin: 0; }
+
+  .input-prefix-wrap { position: relative; display: flex; align-items: center; }
+  .input-prefix {
+    position: absolute; left: 0.75rem;
+    font-size: 0.8rem; font-weight: 700; color: var(--mra-gray-500);
+    font-family: var(--font-mono); pointer-events: none; z-index: 1;
+  }
+  .form-control.has-prefix { padding-left: 3.2rem; }
+  .is-invalid { border-color: var(--mra-red) !important; }
+
+  .method-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 0.6rem;
+    margin-top: 0.5rem;
+  }
+  @media (max-width: 600px) { .method-grid { grid-template-columns: repeat(2, 1fr); } }
+  .method-option input[type="radio"] { display: none; }
+  .method-option-inner {
+    display: flex; flex-direction: column; align-items: center; gap: 0.3rem;
+    padding: 0.85rem 0.5rem;
+    border: 2px solid var(--mra-gray-200); border-radius: var(--radius);
+    cursor: pointer; transition: all 0.15s; text-align: center;
+  }
+  .method-option:hover .method-option-inner { border-color: var(--mra-green); background: var(--mra-green-light); }
+  .method-option input:checked + .method-option-inner {
+    border-color: var(--mra-green); background: var(--mra-green-light);
+    box-shadow: 0 0 0 3px rgba(0,90,48,0.1);
+  }
+  .method-icon  { font-size: 1.3rem; }
+  .method-label { font-size: 0.78rem; font-weight: 700; color: var(--mra-gray-900); }
+
+  .pending-notice {
+    display: flex; align-items: center; gap: 0.6rem;
+    background: var(--mra-gold-light); border-left: 3px solid var(--mra-gold);
+    border-radius: 0 var(--radius) var(--radius) 0;
+    padding: 0.75rem 1rem; font-size: 0.85rem; color: #7a5800;
+    margin-top: 0.5rem;
+  }
+
+  /* Summary panel */
+  .summary-card { padding: 1.25rem; }
+  .summary-title {
+    font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--mra-gray-500); font-family: var(--font-sans);
+    font-weight: 700; margin-bottom: 0.75rem;
+  }
+  .summary-tin {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 1rem; padding-bottom: 0.75rem;
+    border-bottom: 1px solid var(--mra-gray-200); font-size: 0.82rem;
+  }
+  .summary-rows { display: flex; flex-direction: column; margin-bottom: 1rem; }
+  .summary-row {
+    display: flex; justify-content: space-between; align-items: flex-start;
+    padding: 0.45rem 0; border-bottom: 1px dashed var(--mra-gray-100); gap: 0.5rem;
+  }
+  .summary-label { font-size: 0.78rem; color: var(--mra-gray-500); flex-shrink: 0; }
+  .summary-value { font-size: 0.83rem; font-weight: 600; color: var(--mra-gray-900); text-align: right; }
+  .summary-status { text-align: center; margin-bottom: 1rem; }
+
+  .open-returns-mini {
+    border-top: 1px solid var(--mra-gray-200); padding-top: 0.75rem; margin-top: 0.25rem;
+  }
+  .mini-label {
+    font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.07em;
+    color: var(--mra-gray-500); font-weight: 700; margin-bottom: 0.4rem;
+  }
+  .mini-return {
+    display: flex; justify-content: space-between;
+    padding: 0.3rem 0; font-size: 0.78rem;
+    border-bottom: 1px dashed var(--mra-gray-100);
+  }
+</style>
+
+<script>
+  const fmt = (n: number) => new Intl.NumberFormat('en-MW', {
+    style: 'currency', currency: 'MWK', minimumFractionDigits: 2
+  }).format(n);
+
+  const methodLabels: Record<string, string> = {
+    bank_transfer: 'Bank Transfer',
+    mobile_money:  'Mobile Money',
+    cash:          'Cash',
+    cheque:        'Cheque',
+  };
+
+  // Update summary panel live
+  document.getElementById('amount')?.addEventListener('input', (e) => {
+    const val = parseFloat((e.target as HTMLInputElement).value) || 0;
+    const el = document.getElementById('summary-amount');
+    if (el) el.textContent = val > 0 ? fmt(val) : 'MWK —';
+  });
+
+  document.getElementById('payment_date')?.addEventListener('change', (e) => {
+    const val = (e.target as HTMLInputElement).value;
+    const el  = document.getElementById('summary-date');
+    if (el && val) {
+      el.textContent = new Date(val).toLocaleDateString('en-GB', { day:'2-digit', month:'short', year:'numeric' });
+    }
+  });
+
+  document.querySelectorAll('input[name="payment_method"]').forEach(radio => {
+    radio.addEventListener('change', () => {
+      const el = document.getElementById('summary-method');
+      if (el) el.textContent = methodLabels[(radio as HTMLInputElement).value] || '—';
+    });
+  });
+
+  // Trigger initial amount display if prefilled
+  const amountInput = document.getElementById('amount') as HTMLInputElement;
+  if (amountInput?.value) {
+    const el = document.getElementById('summary-amount');
+    if (el) el.textContent = fmt(parseFloat(amountInput.value));
+  }
+
+  // Trigger initial date
+  const dateInput = document.getElementById('payment_date') as HTMLInputElement;
+  if (dateInput?.value) {
+    const el = document.getElementById('summary-date');
+    if (el) el.textContent = new Date(dateInput.value).toLocaleDateString('en-GB', { day:'2-digit', month:'short', year:'numeric' });
+  }
+</script>
+
+<script>
+  // Handle return selection — auto-fill amount and tax type
+  function handleReturnSelect(select: HTMLSelectElement) {
+    const opt = select.options[select.selectedIndex];
+    const amount  = opt.dataset.amount;
+    const taxType = opt.dataset.type;
+    const refText = opt.text.split('·')[0]?.trim() || 'None';
+
+    const amountInput  = document.getElementById('amount') as HTMLInputElement;
+    const taxTypeSelect= document.getElementById('tax_type') as HTMLSelectElement;
+    const summaryReturn= document.getElementById('summary-return');
+    const summaryAmount= document.getElementById('summary-amount');
+
+    if (amount && amountInput) {
+      amountInput.value = amount;
+      if (summaryAmount) {
+        summaryAmount.textContent = new Intl.NumberFormat('en-MW', {
+          style: 'currency', currency: 'MWK', minimumFractionDigits: 2
+        }).format(parseFloat(amount));
+      }
+    }
+    if (taxType && taxTypeSelect) {
+      taxTypeSelect.value = taxType;
+    }
+    if (summaryReturn) {
+      summaryReturn.textContent = select.value ? refText : 'None';
+    }
+  }
+
+  // Trigger on page load if return pre-selected
+  const returnSelect = document.getElementById('return_id') as HTMLSelectElement;
+  if (returnSelect?.value) handleReturnSelect(returnSelect);
+</script>

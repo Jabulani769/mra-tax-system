@@ -1,0 +1,266 @@
+---
+import DashLayout from '../../layouts/DashLayout.astro';
+import { createSupabaseServer, formatMWK, formatDate } from '../../lib/supabase';
+
+const supabase = createSupabaseServer(Astro.cookies);
+const { data: { session } } = await supabase.auth.getSession();
+if (!session) return Astro.redirect('/login');
+
+const { data: userProfile } = await supabase
+  .from('users').select('*').eq('id', session.user.id).single();
+const role = userProfile?.role || 'taxpayer';
+
+const { data: taxpayer } = await supabase
+  .from('taxpayers').select('*').eq('user_id', session.user.id).single();
+
+if (role === 'taxpayer' && !taxpayer) return Astro.redirect('/profile/setup');
+
+const statusFilter = Astro.url.searchParams.get('status') || 'all';
+const typeFilter   = Astro.url.searchParams.get('type')   || 'all';
+
+let query;
+if (role === 'taxpayer') {
+  query = supabase
+    .from('payments')
+    .select('*, tax_returns(return_reference, tax_type)')
+    .eq('taxpayer_id', taxpayer.id)
+    .order('created_at', { ascending: false });
+} else {
+  query = supabase
+    .from('payments')
+    .select('*, taxpayers(tin, name), tax_returns(return_reference, tax_type)')
+    .order('created_at', { ascending: false })
+    .limit(150);
+}
+
+if (statusFilter !== 'all') query = query.eq('status', statusFilter);
+if (typeFilter   !== 'all') query = query.eq('tax_type', typeFilter);
+
+const { data: payments } = await query;
+const all = payments || [];
+
+const counts = {
+  all:       all.length,
+  pending:   all.filter(p => p.status === 'pending').length,
+  confirmed: all.filter(p => p.status === 'confirmed').length,
+  reversed:  all.filter(p => p.status === 'reversed').length,
+};
+
+const totalConfirmed = all
+  .filter(p => p.status === 'confirmed')
+  .reduce((s, p) => s + (Number(p.amount) || 0), 0);
+
+const totalPending = all
+  .filter(p => p.status === 'pending')
+  .reduce((s, p) => s + (Number(p.amount) || 0), 0);
+
+const taxTypeLabel: Record<string, string> = {
+  income_tax:      'Income Tax',
+  vat:             'VAT',
+  withholding_tax: 'Withholding Tax',
+  corporate_tax:   'Corporate Tax',
+  pay_as_you_earn: 'PAYE',
+};
+
+const methodLabel: Record<string, string> = {
+  bank_transfer: 'Bank Transfer',
+  mobile_money:  'Mobile Money',
+  cash:          'Cash',
+  cheque:        'Cheque',
+};
+---
+
+<DashLayout title="Payments" activeNav="/payments">
+
+  <div class="page-header">
+    <div>
+      <h1 class="page-title">Payments</h1>
+      <p class="page-subtitle">
+        {role === 'taxpayer' ? 'Your payment history and records' : 'All taxpayer payment records'}
+      </p>
+    </div>
+    {role === 'taxpayer' && (
+      <a href="/payments/new" class="btn btn-primary">+ Record Payment</a>
+    )}
+  </div>
+
+  <!-- Summary stats -->
+  <div class="stats-grid" style="margin-bottom:1.25rem;">
+    <div class="stat-card green">
+      <div class="stat-label">Confirmed</div>
+      <div class="stat-value" style="font-size:1.15rem;">{formatMWK(totalConfirmed)}</div>
+      <div class="stat-sub">{counts.confirmed} payment{counts.confirmed !== 1 ? 's' : ''}</div>
+    </div>
+    <div class="stat-card gold">
+      <div class="stat-label">Pending</div>
+      <div class="stat-value" style="font-size:1.15rem;">{formatMWK(totalPending)}</div>
+      <div class="stat-sub">{counts.pending} awaiting confirmation</div>
+    </div>
+    <div class="stat-card blue">
+      <div class="stat-label">Total Records</div>
+      <div class="stat-value">{counts.all}</div>
+      <div class="stat-sub">All time</div>
+    </div>
+  </div>
+
+  <!-- Status tabs -->
+  <div class="status-tabs">
+    {[
+      { key: 'all',       label: 'All' },
+      { key: 'pending',   label: 'Pending' },
+      { key: 'confirmed', label: 'Confirmed' },
+      { key: 'reversed',  label: 'Reversed' },
+    ].map(tab => (
+      <a
+        href={`/payments?status=${tab.key}${typeFilter !== 'all' ? `&type=${typeFilter}` : ''}`}
+        class={`status-tab ${statusFilter === tab.key ? 'active' : ''}`}
+      >
+        {tab.label}
+        <span class="tab-count">{counts[tab.key as keyof typeof counts] ?? all.length}</span>
+      </a>
+    ))}
+  </div>
+
+  <!-- Filters -->
+  <div class="filters-row">
+    <div class="filter-group">
+      <label class="filter-label">Tax Type</label>
+      <select
+        class="filter-select"
+        onchange={`window.location='/payments?status=${statusFilter}&type='+this.value`}
+      >
+        <option value="all" selected={typeFilter === 'all'}>All Types</option>
+        <option value="income_tax"      selected={typeFilter === 'income_tax'}>Income Tax</option>
+        <option value="vat"             selected={typeFilter === 'vat'}>VAT</option>
+        <option value="withholding_tax" selected={typeFilter === 'withholding_tax'}>Withholding Tax</option>
+        <option value="corporate_tax"   selected={typeFilter === 'corporate_tax'}>Corporate Tax</option>
+        <option value="pay_as_you_earn" selected={typeFilter === 'pay_as_you_earn'}>PAYE</option>
+      </select>
+    </div>
+    <div class="filter-meta">
+      Showing <strong>{all.length}</strong> payment{all.length !== 1 ? 's' : ''}
+      {statusFilter !== 'all' && <> · <strong style="text-transform:capitalize;">{statusFilter}</strong></>}
+    </div>
+  </div>
+
+  <!-- Table -->
+  <div class="card" style="padding:0; margin-top:1rem;">
+    {all.length > 0 ? (
+      <div class="table-wrapper" style="border:none;">
+        <table>
+          <thead>
+            <tr>
+              <th>Reference</th>
+              {role !== 'taxpayer' && <th>Taxpayer</th>}
+              <th>Tax Type</th>
+              <th>Return Ref</th>
+              <th>Amount</th>
+              <th>Method</th>
+              <th>Date</th>
+              <th>Status</th>
+              {role !== 'taxpayer' && <th></th>}
+            </tr>
+          </thead>
+          <tbody>
+            {all.map(p => (
+              <tr>
+                <td class="mono" style="font-size:0.82rem; font-weight:600;">{p.payment_reference}</td>
+                {role !== 'taxpayer' && (
+                  <td>
+                    <div class="taxpayer-name">{p.taxpayers?.name || '—'}</div>
+                    <div class="taxpayer-tin mono">{p.taxpayers?.tin || '—'}</div>
+                  </td>
+                )}
+                <td>{taxTypeLabel[p.tax_type] || p.tax_type || '—'}</td>
+                <td class="mono" style="font-size:0.8rem;">
+                  {p.tax_returns?.return_reference
+                    ? <a href={`/returns/${p.return_id}`}>{p.tax_returns.return_reference}</a>
+                    : '—'}
+                </td>
+                <td class="mono" style="font-weight:700;">{formatMWK(p.amount)}</td>
+                <td style="font-size:0.88rem;">{methodLabel[p.payment_method] || p.payment_method || '—'}</td>
+                <td class="text-sm text-muted">{formatDate(p.payment_date)}</td>
+                <td>
+                  <span class={`badge ${
+                    p.status === 'confirmed' ? 'badge-green' :
+                    p.status === 'reversed'  ? 'badge-red'   : 'badge-yellow'
+                  }`}>{p.status}</span>
+                </td>
+                {role !== 'taxpayer' && (
+                  <td>
+                    {p.status === 'pending' && (
+                      <form method="POST" action="/api/payments/confirm" style="display:inline;">
+                        <input type="hidden" name="payment_id" value={p.id} />
+                        <button type="submit" class="btn btn-primary btn-sm">Confirm</button>
+                      </form>
+                    )}
+                  </td>
+                )}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    ) : (
+      <div class="empty-state">
+        <div class="empty-state-icon">💳</div>
+        <h3>No payments found</h3>
+        <p>
+          {statusFilter !== 'all' || typeFilter !== 'all'
+            ? 'Try clearing the filters.'
+            : role === 'taxpayer'
+              ? 'You have no payment records yet.'
+              : 'No payments have been recorded yet.'}
+        </p>
+        {role === 'taxpayer' && statusFilter === 'all' && (
+          <a href="/payments/new" class="btn btn-primary btn-sm">Record First Payment</a>
+        )}
+        {(statusFilter !== 'all' || typeFilter !== 'all') && (
+          <a href="/payments" class="btn btn-ghost btn-sm">Clear Filters</a>
+        )}
+      </div>
+    )}
+  </div>
+
+</DashLayout>
+
+<style>
+  .status-tabs {
+    display: flex; border-bottom: 2px solid var(--mra-gray-200);
+    overflow-x: auto;
+  }
+  .status-tab {
+    display: flex; align-items: center; gap: 0.4rem;
+    padding: 0.7rem 1.1rem; font-size: 0.86rem; font-weight: 600;
+    color: var(--mra-gray-500); text-decoration: none;
+    border-bottom: 2px solid transparent; margin-bottom: -2px;
+    white-space: nowrap; transition: all 0.15s;
+  }
+  .status-tab:hover { color: var(--mra-green); text-decoration: none; }
+  .status-tab.active { color: var(--mra-green); border-bottom-color: var(--mra-green); }
+  .tab-count {
+    background: var(--mra-gray-200); color: var(--mra-gray-600);
+    font-size: 0.72rem; font-weight: 700; padding: 0.1em 0.5em;
+    border-radius: 999px; min-width: 20px; text-align: center;
+  }
+  .status-tab.active .tab-count { background: var(--mra-green-light); color: var(--mra-green); }
+
+  .filters-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0.75rem 0; flex-wrap: wrap; gap: 0.75rem;
+  }
+  .filter-group { display: flex; align-items: center; gap: 0.5rem; }
+  .filter-label { font-size: 0.82rem; font-weight: 600; color: var(--mra-gray-500); }
+  .filter-select {
+    padding: 0.35rem 2rem 0.35rem 0.7rem;
+    border: 1.5px solid var(--mra-gray-300); border-radius: var(--radius);
+    font-size: 0.85rem; font-family: var(--font-sans); color: var(--mra-gray-900);
+    background: #fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%23666' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 0.6rem center;
+    appearance: none; cursor: pointer;
+  }
+  .filter-select:focus { outline: none; border-color: var(--mra-green); }
+  .filter-meta { font-size: 0.83rem; color: var(--mra-gray-500); }
+
+  .taxpayer-name { font-size: 0.88rem; font-weight: 600; color: var(--mra-gray-900); }
+  .taxpayer-tin  { font-size: 0.75rem; color: var(--mra-gray-500); }
+</style>
